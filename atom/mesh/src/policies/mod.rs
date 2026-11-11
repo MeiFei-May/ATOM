@@ -17,6 +17,7 @@ mod prefix_hash;
 mod random;
 mod registry;
 mod round_robin;
+mod session_affinity;
 pub mod tree;
 pub(crate) mod utils;
 pub use cache_aware::CacheAwarePolicy;
@@ -124,6 +125,12 @@ pub trait LoadBalancingPolicy: Send + Sync + Debug {
         false
     }
 
+    /// Soft affinity may move this session when the returned value is true.
+    /// Existing policies keep the bound worker, matching a hard pin.
+    fn overrides_session_affinity(&self) -> bool {
+        false
+    }
+
     /// Update worker load information
     ///
     /// This is called periodically with current load information for load-aware policies.
@@ -197,6 +204,9 @@ pub struct SelectWorkerInfo<'a> {
     pub tokens: Option<&'a [u32]>,
     /// HTTP headers for header-based routing policies
     pub headers: Option<&'a http::HeaderMap>,
+    /// Bound worker index supplied by session affinity in soft mode.
+    /// Policies that do not override session affinity ignore it.
+    pub preferred_worker: Option<usize>,
     /// Pre-computed hash ring for O(log n) consistent hashing
     /// Built and cached by WorkerRegistry, passed through to avoid per-request rebuilds
     pub hash_ring: Option<Arc<HashRing>>,
