@@ -1476,11 +1476,14 @@ class Scheduler:
         remaining = seq.num_tokens - start
         if 0 < self.long_prefill_token_threshold < seq.num_tokens - cap_from:
             remaining = self.long_prefill_token_threshold + cap_from - start
+        room = self._prefill_room(batched_tokens, start)
         if self._slice_cold_partial(seq, start, resume):
-            remaining = min(remaining, self._cold_slice_left(cold_tokens))
+            # Limit the budget, not `remaining`: a request's own remainder is
+            # what tells a final chunk (exempt from alignment) from a cut one.
+            room = min(room, self._cold_slice_left(cold_tokens))
         chunk = self._chunked_prefill_size(
             remaining,
-            self._prefill_room(batched_tokens, start),
+            room,
             batched_tokens,
             history_len=start,
             kind=ChunkKind.NEXT,

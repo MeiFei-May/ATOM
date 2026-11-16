@@ -462,6 +462,22 @@ def test_first_restore_parked_this_tick_slices_the_running_cold_partial():
     assert result["widths"][0] == 8192  # not the whole 32768 budget
 
 
+def test_cold_slice_remainder_is_floored_to_the_grid_not_taken_as_a_final_chunk():
+    s, _, cold, _ = fixture()
+    s._tick_cold_partial_cap = 8192
+    s._chunk_alignment = lambda: 128
+    s._prefill_room = lambda batched, start: 32768 - batched
+
+    def chunk(spent):
+        return s._partial_prefill_chunk(
+            cold, 0, 0, spent, cap_from=0, cold_tokens=spent
+        )
+
+    assert chunk(0) == 8192
+    assert chunk(8192 - 1000) == 896  # floored onto the grid, not 1000
+    assert chunk(8192 - 92) == 0  # under one aligned unit: no 92-row sliver
+
+
 def test_active_cold_fork_retains_original_path_instead_of_overfilling_new_budget():
     s, ready, cold, _ = fixture()
     cold.state_fork_src = 99
