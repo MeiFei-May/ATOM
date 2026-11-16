@@ -4036,7 +4036,7 @@ class Scheduler:
             ),
             None,
         )
-        if head is None or self._offload_lookup_pending(head):
+        if head is None or self._head_waits_on_tier_lookup(head):
             return False, False
         return False, (
             (self.kv_connector is None or self.kv_connector.admission_ready(head))

@@ -247,7 +247,6 @@ def schedule_fixture(s):
     s._prefix_bypass_limit = lambda: 4
     s._unschedulable_reason = lambda seq: None
     s._lookup_detach_enabled = lambda seq: False
-    s._offload_lookup_pending = lambda seq: False
     s._query_connector_prefill_match = lambda seq, skip: False
     s._local_prefill_coalescing = False
     s._probe_hbm_prefix = lambda seq: SimpleNamespace(num_cached_blocks=0)
@@ -422,6 +421,27 @@ def test_forced_cold_tick_keeps_the_deferred_ready_at_the_front():
     result = capture_schedule(s)
     assert result["ids"] == [cold.id]
     assert list(s.waiting) == [ready, later]
+
+
+def test_forced_cold_tick_probe_does_not_start_the_lookup_defer_clock():
+    s, ready, cold, _ = fixture()
+    schedule_fixture(s)
+    s._ready_short_cold_stalls = 3
+    cold.status = SequenceStatus.WAITING
+    calls = []
+
+    def lookup_pending(seq):
+        calls.append(seq.id)  # would start the defer clock
+        return True
+
+    s.kv_connector.lookup_would_defer = lambda seq: True
+    s.kv_connector.lookup_pending = lookup_pending
+    s._lookup_detach_enabled = lambda seq: False
+    s.running.clear()
+    s.waiting = deque([ready, cold])
+    priority, force_cold = s._ready_suffix_tick_plan(True)
+    assert (priority, force_cold) == (False, False)  # head waits on its lookup
+    assert calls == []
 
 
 def test_active_cold_fork_retains_original_path_instead_of_overfilling_new_budget():
