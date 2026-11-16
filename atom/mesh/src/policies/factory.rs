@@ -18,7 +18,8 @@ impl PolicyFactory {
         Self::create(config, &SessionAffinityConfig::default())
     }
 
-    /// Create a policy and wrap it with a session table.
+    /// Create a policy and wrap it with a session table, unless session affinity
+    /// is off.
     ///
     /// Each call gets its own table, so prefill and decode do not share bindings.
     pub fn create(
@@ -34,11 +35,25 @@ impl PolicyFactory {
         scope: SessionAffinityScope,
     ) -> Arc<dyn LoadBalancingPolicy> {
         if matches!(config, PolicyConfig::DpSticky) {
-            return Arc::new(DpStickyPolicy::with_config(affinity.clone(), scope));
+            return Arc::new(DpStickyPolicy::with_config(
+                dp_sticky_affinity(affinity),
+                scope,
+            ));
+        }
+        Self::wrap(affinity, Self::create_bare(config), scope)
+    }
+
+    fn wrap(
+        affinity: &SessionAffinityConfig,
+        bare: Arc<dyn LoadBalancingPolicy>,
+        scope: SessionAffinityScope,
+    ) -> Arc<dyn LoadBalancingPolicy> {
+        if !affinity.is_enabled() {
+            return bare;
         }
         Arc::new(SessionAffinityPolicy::around_scoped(
             affinity.clone(),
-            Self::create_bare(config),
+            bare,
             scope,
         ))
     }
@@ -92,7 +107,7 @@ impl PolicyFactory {
             "round_robin" | "roundrobin" => Arc::new(RoundRobinPolicy::new()),
             "dp_sticky" | "dpsticky" => {
                 return Some(Arc::new(DpStickyPolicy::with_config(
-                    affinity.clone(),
+                    dp_sticky_affinity(affinity),
                     SessionAffinityScope::Regular,
                 )));
             }
@@ -101,11 +116,19 @@ impl PolicyFactory {
             "prefix_hash" | "prefixhash" => Arc::new(PrefixHashPolicy::with_defaults()),
             _ => return None,
         };
-        Some(Arc::new(SessionAffinityPolicy::around_scoped(
-            affinity.clone(),
-            bare,
-            SessionAffinityScope::Regular,
-        )))
+        Some(Self::wrap(affinity, bare, SessionAffinityScope::Regular))
+    }
+}
+
+/// `dp_sticky` pins sessions whether or not session affinity is on. Off, it keys
+/// on `x-session-id` only, as it did before session affinity existed.
+fn dp_sticky_affinity(affinity: &SessionAffinityConfig) -> SessionAffinityConfig {
+    if affinity.is_enabled() {
+        return affinity.clone();
+    }
+    SessionAffinityConfig {
+        session_id_headers: vec!["x-session-id".to_string()],
+        ..affinity.clone()
     }
 }
 
@@ -256,6 +279,37 @@ mod tests {
                 expected_name
             );
         }
+    }
+
+    #[tokio::test]
+    async fn affinity_off_leaves_policies_bare_and_dp_sticky_on_x_session_id() {
+        let off = SessionAffinityConfig {
+            session_id_headers: Vec::new(),
+            ..SessionAffinityConfig::default()
+        };
+        let random = PolicyFactory::create(&PolicyConfig::Random, &off);
+        assert!(random.as_any().downcast_ref::<RandomPolicy>().is_some());
+        let named = PolicyFactory::create_by_name_with("round_robin", &off).unwrap();
+        assert!(named.as_any().downcast_ref::<RoundRobinPolicy>().is_some());
+
+        let dp_sticky = PolicyFactory::create(&PolicyConfig::DpSticky, &off);
+        let workers: Vec<Arc<dyn crate::core::Worker>> = ["http://w1:8000", "http://w2:8000"]
+            .into_iter()
+            .map(|url| {
+                Arc::new(crate::core::BasicWorkerBuilder::new(url).build())
+                    as Arc<dyn crate::core::Worker>
+            })
+            .collect();
+        let mut headers = http::HeaderMap::new();
+        headers.insert("x-session-id", "session-1".parse().unwrap());
+        let info = crate::policies::SelectWorkerInfo {
+            headers: Some(&headers),
+            ..Default::default()
+        };
+        let first = dp_sticky.select_worker(&workers, &info).await.unwrap();
+        workers[first].increment_load();
+        workers[first].increment_load();
+        assert_eq!(dp_sticky.select_worker(&workers, &info).await, Some(first));
     }
 
     #[test]

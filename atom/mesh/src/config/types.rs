@@ -71,6 +71,14 @@ fn default_session_affinity_ttl_secs() -> u64 {
     DEFAULT_SESSION_AFFINITY_TTL_SECS
 }
 
+/// Most bindings one session table holds. A key that is not stable per session,
+/// such as a per-request value, would otherwise grow the table for a whole TTL.
+pub const DEFAULT_SESSION_AFFINITY_MAX_ENTRIES: usize = 1_000_000;
+
+fn default_session_affinity_max_entries() -> usize {
+    DEFAULT_SESSION_AFFINITY_MAX_ENTRIES
+}
+
 /// `hard` keeps the bound worker. `soft` keeps it too, unless the inner policy
 /// opts in and chooses another worker.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -94,10 +102,15 @@ pub enum SessionParentMode {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SessionAffinityConfig {
+    /// Headers checked in order for a session key. An empty list turns session
+    /// affinity off for every policy but `dp_sticky`, which then keys on
+    /// `x-session-id`.
     #[serde(default = "default_session_id_headers")]
     pub session_id_headers: Vec<String>,
     #[serde(default = "default_session_affinity_ttl_secs")]
     pub ttl_secs: u64,
+    #[serde(default = "default_session_affinity_max_entries")]
+    pub max_entries: usize,
     #[serde(default)]
     pub mode: SessionAffinityMode,
     #[serde(default)]
@@ -109,6 +122,7 @@ impl Default for SessionAffinityConfig {
         Self {
             session_id_headers: default_session_id_headers(),
             ttl_secs: default_session_affinity_ttl_secs(),
+            max_entries: default_session_affinity_max_entries(),
             mode: SessionAffinityMode::Hard,
             parent_mode: SessionParentMode::Independent,
         }
@@ -116,7 +130,12 @@ impl Default for SessionAffinityConfig {
 }
 
 impl SessionAffinityConfig {
-    /// Reject settings that would silently disable affinity or expire every request.
+    pub fn is_enabled(&self) -> bool {
+        !self.session_id_headers.is_empty()
+    }
+
+    /// Reject settings that would expire every request, bound nothing, or name a
+    /// header no request can carry.
     pub fn validate(&self) -> ConfigResult<()> {
         if self.ttl_secs == 0 {
             return Err(ConfigError::InvalidValue {
@@ -125,16 +144,22 @@ impl SessionAffinityConfig {
                 reason: "idle ttl must be at least 1 second".to_string(),
             });
         }
-        if !self
+        if self.max_entries == 0 {
+            return Err(ConfigError::InvalidValue {
+                field: "session_affinity_max_entries".to_string(),
+                value: "0".to_string(),
+                reason: "the session table must hold at least 1 binding".to_string(),
+            });
+        }
+        if let Some(header) = self
             .session_id_headers
             .iter()
-            .any(|header| !header.trim().is_empty())
+            .find(|header| http::HeaderName::from_bytes(header.as_bytes()).is_err())
         {
             return Err(ConfigError::InvalidValue {
                 field: "session_id_headers".to_string(),
-                value: self.session_id_headers.join(","),
-                reason: "at least one session header is required; an empty list disables affinity"
-                    .to_string(),
+                value: header.clone(),
+                reason: "not a valid HTTP header name".to_string(),
             });
         }
         Ok(())

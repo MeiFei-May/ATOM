@@ -557,6 +557,23 @@ impl LoadBalancingPolicy for CacheAwarePolicy {
         true
     }
 
+    /// A pinned turn grows the session's prefix on its worker; the tree learns it
+    /// as it would from its own placement.
+    fn on_session_hit(
+        &self,
+        workers: &[Arc<dyn Worker>],
+        info: &SelectWorkerInfo<'_>,
+        index: usize,
+    ) {
+        let Some(text) = info.request_text else {
+            return;
+        };
+        let model_id = tree_key_for_worker(workers[index].as_ref());
+        if let Some(tree) = self.trees.get(&model_id).map(|entry| entry.value().clone()) {
+            tree.insert(text, workers[index].url());
+        }
+    }
+
     fn as_any(&self) -> &dyn std::any::Any {
         self
     }

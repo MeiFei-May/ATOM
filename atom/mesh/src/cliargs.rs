@@ -7,6 +7,7 @@ use crate::{
         AtomPdRankMappingPolicy, BackendType, CircuitBreakerConfig, ConfigError, ConfigResult,
         HealthCheckConfig, MetricsConfig, PolicyConfig, RetryConfig, RouterConfig, RoutingMode,
         SessionAffinityConfig, SessionAffinityMode, SessionParentMode, TokenizerCacheConfig,
+        DEFAULT_SESSION_AFFINITY_MAX_ENTRIES, DEFAULT_SESSION_AFFINITY_TTL_SECS,
         DEFAULT_SESSION_ID_HEADERS,
     },
     core::ConnectionMode,
@@ -277,6 +278,7 @@ pub struct CliArgs {
 
     /// Headers checked in order for a session key. The first non-empty value wins.
     /// `x-correlation-id` is not included: this router uses it as a per-request id.
+    /// An empty list turns session affinity off; `dp_sticky` then keys on `x-session-id`.
     #[arg(
         long,
         default_value = DEFAULT_SESSION_ID_HEADERS,
@@ -284,9 +286,18 @@ pub struct CliArgs {
     )]
     pub session_id_headers: String,
 
-    /// Idle seconds before a session binding can be placed again. Default is 120 minutes.
-    #[arg(long, default_value_t = 7200, help_heading = "Routing Policy")]
+    /// Idle seconds before a session binding can be placed again.
+    #[arg(long, default_value_t = DEFAULT_SESSION_AFFINITY_TTL_SECS, help_heading = "Routing Policy")]
     pub session_affinity_ttl_secs: u64,
+
+    /// Most bindings each session table holds. Past it, the least recently used
+    /// tenth of the table is dropped.
+    #[arg(
+        long,
+        default_value_t = DEFAULT_SESSION_AFFINITY_MAX_ENTRIES,
+        help_heading = "Routing Policy"
+    )]
+    pub session_affinity_max_entries: usize,
 
     /// `hard` keeps the bound worker. `soft` lets `cache_aware` move a session whose
     /// worker is over `--balance-abs-threshold` and `--balance-rel-threshold` against
@@ -626,6 +637,7 @@ impl CliArgs {
         Ok(SessionAffinityConfig {
             session_id_headers,
             ttl_secs: self.session_affinity_ttl_secs,
+            max_entries: self.session_affinity_max_entries,
             mode,
             parent_mode,
         })
@@ -979,7 +991,7 @@ mod tests {
     }
 
     #[test]
-    fn cli_rejects_zero_session_ttl_and_empty_session_headers() {
+    fn cli_rejects_zero_session_ttl_and_invalid_session_headers() {
         let zero_ttl =
             Cli::try_parse_from(["atomesh", "launch", "--session-affinity-ttl-secs", "0"])
                 .expect("zero ttl should parse");
@@ -995,19 +1007,36 @@ mod tests {
             "{ttl_error}"
         );
 
-        let empty_headers = Cli::try_parse_from(["atomesh", "launch", "--session-id-headers", ","])
-            .expect("empty header list should parse");
-        let empty_headers = match empty_headers.command {
+        let bad_header = Cli::try_parse_from([
+            "atomesh",
+            "launch",
+            "--session-id-headers",
+            "x-session-id,x session",
+        ])
+        .expect("header list should parse");
+        let bad_header = match bad_header.command {
             Some(Commands::Launch { args }) => args,
-            None => empty_headers.router_args,
+            None => bad_header.router_args,
         };
-        let header_error = empty_headers
+        let header_error = bad_header
             .to_router_config(Vec::new())
-            .expect_err("empty session headers should be rejected");
+            .expect_err("an invalid header name should be rejected");
         assert!(
             header_error.to_string().contains("session_id_headers"),
             "{header_error}"
         );
+    }
+
+    #[test]
+    fn cli_empty_session_headers_turn_affinity_off() {
+        let cli = Cli::try_parse_from(["atomesh", "launch", "--session-id-headers", ""])
+            .expect("empty header list should parse");
+        let args = match cli.command {
+            Some(Commands::Launch { args }) => args,
+            None => cli.router_args,
+        };
+        let config = args.to_router_config(Vec::new()).expect("router config");
+        assert!(!config.session_affinity.is_enabled());
     }
 }
 
@@ -1031,7 +1060,8 @@ impl Default for CliArgs {
             dp_aware: false,
             kv_events: false,
             session_id_headers: DEFAULT_SESSION_ID_HEADERS.to_string(),
-            session_affinity_ttl_secs: 7200,
+            session_affinity_ttl_secs: DEFAULT_SESSION_AFFINITY_TTL_SECS,
+            session_affinity_max_entries: DEFAULT_SESSION_AFFINITY_MAX_ENTRIES,
             session_affinity_mode: "hard".to_string(),
             session_parent_mode: "independent".to_string(),
             pd_disaggregation: false,

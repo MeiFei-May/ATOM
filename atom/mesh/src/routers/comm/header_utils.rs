@@ -79,11 +79,14 @@ pub fn should_forward_request_header(name: &str) -> bool {
 
 /// Return the first non-empty header value in `names`.
 #[inline]
-pub fn extract_first_header<'a>(headers: Option<&'a HeaderMap>, names: &[&str]) -> Option<&'a str> {
+pub fn extract_first_header<'a, S: AsRef<str>>(
+    headers: Option<&'a HeaderMap>,
+    names: &[S],
+) -> Option<&'a str> {
     let headers = headers?;
     names
         .iter()
-        .find_map(|name| extract_header_value(Some(headers), name))
+        .find_map(|name| extract_header_value(Some(headers), name.as_ref()))
 }
 
 /// Return one non-empty header value.

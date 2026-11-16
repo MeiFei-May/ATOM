@@ -9,6 +9,7 @@
 //! policy opts in via [`LoadBalancingPolicy::overrides_session_affinity`].
 
 use std::{
+    borrow::Cow,
     collections::HashMap,
     sync::{
         atomic::{AtomicU64, Ordering},
@@ -41,6 +42,9 @@ use crate::{
 
 const NO_SESSION: &str = "no_session";
 const SWEEP_INTERVAL: Duration = Duration::from_secs(30);
+/// Prefixes a parent group key. The header values a key is read from are
+/// visible ASCII, so no session id can start with this control character.
+const PARENT_KEY_PREFIX: &str = "\u{1}parent:";
 
 /// Which session table produced a decision. Prefill and decode are separate
 /// counters so a healthy decode table cannot hide prefill misses.
@@ -99,25 +103,59 @@ impl SessionTable {
     /// was sent, so the next dispatch can tell whether the worker changed.
     fn assign(
         &self,
-        key: String,
+        key: &str,
         worker: WorkerIdentity,
         now: Instant,
         reassigned: Option<&'static str>,
     ) {
-        let mut entry = self
-            .assignments
-            .entry(key)
-            .or_insert_with(|| StickyAssignment {
-                worker: worker.clone(),
+        if let Some(mut entry) = self.assignments.get_mut(key) {
+            entry.worker = worker;
+            entry.last_access = now;
+            entry.reassigned = reassigned;
+            entry.failed = false;
+            return;
+        }
+        self.assignments.insert(
+            key.to_string(),
+            StickyAssignment {
+                worker,
                 last_access: now,
                 dispatched: None,
-                reassigned: None,
+                reassigned,
                 failed: false,
-            });
-        entry.worker = worker;
-        entry.last_access = now;
-        entry.reassigned = reassigned;
-        entry.failed = false;
+            },
+        );
+    }
+
+    /// Drop the least recently used bindings, other than `keep`, until at most
+    /// `target` remain. Returns how many were dropped.
+    fn evict_least_recent(&self, target: usize, keep: &str) -> usize {
+        let excess = self.assignments.len().saturating_sub(target);
+        if excess == 0 {
+            return 0;
+        }
+        let mut ages: Vec<Instant> = self
+            .assignments
+            .iter()
+            .filter(|entry| entry.key() != keep)
+            .map(|entry| entry.last_access)
+            .collect();
+        if ages.is_empty() {
+            return 0;
+        }
+        let nth = excess.min(ages.len()) - 1;
+        let cutoff = *ages.select_nth_unstable(nth).1;
+        let mut evicted = 0;
+        self.assignments.retain(|key, assignment| {
+            let evict = evicted < excess && assignment.last_access <= cutoff && key != keep;
+            evicted += usize::from(evict);
+            !evict
+        });
+        evicted
+    }
+
+    fn len(&self) -> usize {
+        self.assignments.len()
     }
 
     fn mark_failed(&self, key: &str) {
@@ -360,20 +398,15 @@ impl SessionAffinityPolicy {
         }
     }
 
-    fn binding_key(&self, headers: Option<&http::HeaderMap>) -> Option<String> {
-        let names: Vec<&str> = self
-            .config
-            .session_id_headers
-            .iter()
-            .map(String::as_str)
-            .collect();
-        let session = extract_first_header(headers, &names);
-        let parent = extract_header_value(headers, PARENT_SESSION_HEADER);
+    /// The table key for a request: borrowed from its headers, except a parent
+    /// group key, which is built.
+    fn binding_key<'a>(&self, headers: Option<&'a http::HeaderMap>) -> Option<Cow<'a, str>> {
+        let session = extract_first_header(headers, &self.config.session_id_headers);
         match self.config.parent_mode {
-            SessionParentMode::Group => parent
-                .map(|parent_id| format!("parent:{parent_id}"))
-                .or_else(|| session.map(str::to_string)),
-            SessionParentMode::Independent => session.map(str::to_string),
+            SessionParentMode::Group => extract_header_value(headers, PARENT_SESSION_HEADER)
+                .map(|parent_id| Cow::Owned(format!("{PARENT_KEY_PREFIX}{parent_id}")))
+                .or(session.map(Cow::Borrowed)),
+            SessionParentMode::Independent => session.map(Cow::Borrowed),
         }
     }
 
@@ -409,6 +442,23 @@ impl SessionAffinityPolicy {
         *last = now;
         drop(last);
         self.table.retain_live(now, self.ttl, keep);
+        MeshMetrics::set_session_affinity_entries(self.scope.as_str(), self.table.len());
+    }
+
+    /// Keeps the table within `max_entries`: idle bindings go first, then the
+    /// least recently used tenth, so a full table does not evict on every new
+    /// session. Caller holds `assign_lock`.
+    fn enforce_capacity(&self, now: Instant, keep: &str) {
+        let max = self.config.max_entries;
+        if self.table.len() <= max {
+            return;
+        }
+        self.table.retain_live(now, self.ttl, Some(keep));
+        let evicted = self.table.evict_least_recent(max - max / 10, keep);
+        if evicted > 0 {
+            MeshMetrics::record_session_affinity_evictions(self.scope.as_str(), evicted);
+        }
+        MeshMetrics::set_session_affinity_entries(self.scope.as_str(), self.table.len());
     }
 
     fn bump(&self, result: &'static str) {
@@ -429,7 +479,7 @@ impl SessionAffinityPolicy {
 
     fn record_placement(
         &self,
-        key: String,
+        key: &str,
         worker_index: usize,
         workers: &[Arc<dyn Worker>],
         now: Instant,
@@ -442,6 +492,9 @@ impl SessionAffinityPolicy {
             now,
             reassigned,
         );
+        if result == AFFINITY_NEW {
+            self.enforce_capacity(now, key);
+        }
         self.bump(result);
     }
 
@@ -461,7 +514,7 @@ impl SessionAffinityPolicy {
         };
         let _assign_guard = self.assign_lock.lock().await;
         if chosen != index {
-            self.record_placement(key.to_string(), chosen, workers, now, AFFINITY_REBIND);
+            self.record_placement(key, chosen, workers, now, AFFINITY_REBIND);
             return (Some(chosen), decision);
         }
         self.hit(key, chosen, now)
@@ -514,9 +567,10 @@ impl LoadBalancingPolicy for SessionAffinityPolicy {
             return self.inner.select_with_decision(workers, info).await;
         };
         let now = Instant::now();
-        self.maybe_sweep(now, Some(&key));
+        self.maybe_sweep(now, Some(&*key));
         if let Some(index) = self.fresh_index(&key, workers, now) {
             if !self.allows_soft_move() {
+                self.inner.on_session_hit(workers, info, index);
                 return self.hit(&key, index, now);
             }
             return self.commit_soft_move(&key, index, workers, info, now).await;
@@ -533,7 +587,7 @@ impl LoadBalancingPolicy for SessionAffinityPolicy {
                 return (None, RouteDecision::branch(NO_HEALTHY_WORKERS));
             };
             let result = self.miss_result(&key, now);
-            self.record_placement(key, selected, workers, now, result);
+            self.record_placement(&key, selected, workers, now, result);
             return (Some(selected), RouteDecision::branch(result));
         }
 
@@ -546,7 +600,7 @@ impl LoadBalancingPolicy for SessionAffinityPolicy {
             return self.hit(&key, index, now);
         }
         let result = self.miss_result(&key, now);
-        self.record_placement(key, selected, workers, now, result);
+        self.record_placement(&key, selected, workers, now, result);
         (Some(selected), decision)
     }
 
@@ -921,16 +975,14 @@ mod tests {
                 .select_with_decision(&workers, &turn("abcdefghij"))
                 .await;
             assert_eq!((kept, decision.branch), (Some(0), AFFINITY_HIT), "{mode:?}");
-            if mode == SessionAffinityMode::Soft {
-                // The kept turn reached the tree: a request without a session key
-                // matches its whole prompt on worker 0.
-                let probe = SelectWorkerInfo {
-                    request_text: Some("abcdefghij"),
-                    ..Default::default()
-                };
-                let (owner, decision) = cache_aware.select_with_decision(&workers, &probe).await;
-                assert_eq!((owner, decision.branch), (Some(0), "affinity"));
-            }
+            // The kept turn reached the tree in both modes: a request without a
+            // session key matches its whole prompt on worker 0.
+            let probe = SelectWorkerInfo {
+                request_text: Some("abcdefghij"),
+                ..Default::default()
+            };
+            let (owner, decision) = cache_aware.select_with_decision(&workers, &probe).await;
+            assert_eq!((owner, decision.branch), (Some(0), "affinity"), "{mode:?}");
 
             // Worker 0 is over both thresholds against worker 1.
             for _ in 0..5 {
@@ -1000,6 +1052,70 @@ mod tests {
             Some(1)
         );
         assert_eq!(policy.result_count(AFFINITY_HIT), 1);
+    }
+
+    #[tokio::test]
+    async fn a_session_id_cannot_join_a_parent_group() {
+        let grouped = SessionAffinityConfig {
+            parent_mode: SessionParentMode::Group,
+            ..SessionAffinityConfig::default()
+        };
+        let policy = SessionAffinityPolicy::dp_sticky(grouped);
+        let workers = workers();
+        let child = header_map(&[
+            ("x-dynamo-session-id", "child-a"),
+            ("x-dynamo-parent-session-id", "root"),
+        ]);
+        assert_eq!(policy.select_worker(&workers, &info(&child)).await, Some(0));
+
+        // The group's key cannot be spelled as a session id.
+        let lookalike = header_map(&[("x-session-id", "parent:root")]);
+        assert_eq!(
+            policy.select_worker(&workers, &info(&lookalike)).await,
+            Some(1)
+        );
+        assert_eq!(policy.result_count(AFFINITY_NEW), 2);
+        assert_eq!(policy.result_count(AFFINITY_HIT), 0);
+    }
+
+    #[tokio::test]
+    async fn a_full_table_drops_its_least_recently_used_bindings() {
+        let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        let _recorder = metrics::set_default_local_recorder(&recorder);
+        let config = SessionAffinityConfig {
+            max_entries: 2,
+            ..SessionAffinityConfig::default()
+        };
+        let policy = SessionAffinityPolicy::dp_sticky(config);
+        let workers = workers();
+        for session in ["session-a", "session-b"] {
+            let headers = header_map(&[("x-session-id", session)]);
+            policy
+                .select_worker(&workers, &info(&headers))
+                .await
+                .unwrap();
+        }
+        policy.set_last_access("session-a", Instant::now() - Duration::from_secs(10));
+
+        let headers = header_map(&[("x-session-id", "session-c")]);
+        policy
+            .select_worker(&workers, &info(&headers))
+            .await
+            .unwrap();
+
+        assert!(!policy.has_session("session-a"));
+        assert!(policy.has_session("session-b"));
+        assert!(policy.has_session("session-c"));
+        let rendered = handle.render();
+        assert!(
+            rendered.contains(r#"mesh_session_affinity_evicted_total{scope="regular"} 1"#),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains(r#"mesh_session_affinity_entries{scope="regular"} 2"#),
+            "{rendered}"
+        );
     }
 
     #[tokio::test]

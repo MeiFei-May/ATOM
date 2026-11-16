@@ -107,6 +107,18 @@ pub trait LoadBalancingPolicy: Send + Sync + Debug {
         // Default: no-op for policies that do not track sessions
     }
 
+    /// Called when session affinity sends a request to its bound worker,
+    /// `workers[index]`, without asking this policy. A policy that learns from
+    /// its own placements can learn from this one too.
+    fn on_session_hit(
+        &self,
+        _workers: &[Arc<dyn Worker>],
+        _info: &SelectWorkerInfo<'_>,
+        _index: usize,
+    ) {
+        // Default: no-op for policies that keep no placement history
+    }
+
     /// Called when a request sent to `worker` fails with a server error or
     /// never gets a response. Client errors are not failures.
     fn on_dispatch_failed(

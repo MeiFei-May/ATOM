@@ -67,6 +67,8 @@ skipped after a failed prefill adds none.
 | `mesh_route_prefix_match_ratio` | Histogram, ratio 0 to 1 | `pool`, `policy` | `cache_aware` branches `affinity` and `relocate`. |
 | `mesh_route_selected_worker_active_requests` | Histogram, active requests | `pool`, `policy`, `branch` | Every selection that picks a worker, before the router adds the request (see [below](#selected-workers-active-requests)). |
 | `mesh_session_affinity_total` | Counter, decisions | `result`: `hit`, `new`, `rebind`, `expired`; `scope`: `regular`, `prefill`, `decode` | Every selection of a request with a session key that picks a worker, in every policy (see [session affinity](#session-affinity)). |
+| `mesh_session_affinity_entries` | Gauge, bindings | `scope` | A session table is swept or evicts (see [session affinity](#session-affinity)). |
+| `mesh_session_affinity_evicted_total` | Counter, bindings | `scope` | A new session finds its table over `--session-affinity-max-entries`. |
 | `mesh_session_worker_change_total` | Counter, requests | `pool`, `reason`: `rebind`, `expired`, `rank_mapping` | A session request is sent to a different worker (URL and DP rank) than the session's previous request (see [below](#worker-changes)). |
 | `mesh_selected_dp_rank_total` | Counter, dispatches | `pool`, `worker` (base URL), `dp_rank` (rank or `none`) | HTTP routers send a request, after DP rank mapping (see [below](#dp-ranks)). |
 | `mesh_route_cache_tokens_total` | Counter, tokens | `pool` (`regular` or `prefill`), `kind`: `prompt`, `cached` | HTTP routers; the response reported cached tokens. Any policy (see [below](#router-estimate-and-engine-reported-cached-tokens)). |
@@ -146,6 +148,8 @@ Every policy pins a session to a worker (URL and DP rank) in router memory.
 The session key is the first non-empty header of `--session-id-headers`
 (`x-dynamo-session-id`, `x-session-id`, `x-smg-routing-key`,
 `x-session-affinity`); a request without one is routed by the policy alone.
+An empty `--session-id-headers` turns this off, except for `dp_sticky`, which
+then keys on `x-session-id` only and records the same results.
 `mesh_session_affinity_total` counts each selection of a request with a key:
 
 - `hit`: the pinned worker is healthy and its circuit breaker admits requests;
@@ -161,7 +165,12 @@ The session key is the first non-empty header of `--session-id-headers`
   (120 minutes) and is placed again.
 
 Idle bindings are dropped every 30 seconds, so a session that returns after
-that sweep counts as `new` rather than `expired`. With N turns per session and
+that sweep counts as `new` rather than `expired`. A table holds at most
+`--session-affinity-max-entries` bindings (1,000,000); a new session past it
+drops idle bindings, then the least recently used tenth of the table, and
+those sessions count as `new` when they return. A steadily rising
+`mesh_session_affinity_evicted_total` means the key is not stable per
+session. With N turns per session and
 stable workers, the hit rate approaches (N - 1) / N. `rebind` points at worker
 churn; a router restart makes every session `new` again. Prefill and decode
 keep separate tables, labelled by `scope`. `dp_sticky` also records the result
