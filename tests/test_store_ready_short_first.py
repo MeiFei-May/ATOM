@@ -445,7 +445,7 @@ def test_forced_cold_tick_probe_does_not_start_the_lookup_defer_clock():
 
 
 def test_first_restore_parked_this_tick_slices_the_running_cold_partial():
-    s, ready, cold, _ = fixture()
+    s, _, cold, _ = fixture()
     schedule_fixture(s)
     s.finished_recving_kv_req_ids = []
     s._num_parked_remote_kv = 0  # nothing in flight when the tick starts
