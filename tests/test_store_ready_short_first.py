@@ -444,6 +444,24 @@ def test_forced_cold_tick_probe_does_not_start_the_lookup_defer_clock():
     assert calls == []
 
 
+def test_first_restore_parked_this_tick_slices_the_running_cold_partial():
+    s, ready, cold, _ = fixture()
+    schedule_fixture(s)
+    s.finished_recving_kv_req_ids = []
+    s._num_parked_remote_kv = 0  # nothing in flight when the tick starts
+
+    def early_load():
+        s._num_parked_remote_kv = 1  # the first restore is parked now
+        return 1
+
+    s._early_load_tier_prefixes = early_load
+    s._still_loading = lambda seq: True
+    s._chunk_alignment = lambda: 128
+    result = capture_schedule(s)
+    assert result["ids"][0] == cold.id
+    assert result["widths"][0] == 8192  # not the whole 32768 budget
+
+
 def test_active_cold_fork_retains_original_path_instead_of_overfilling_new_budget():
     s, ready, cold, _ = fixture()
     cold.state_fork_src = 99

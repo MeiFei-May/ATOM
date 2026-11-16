@@ -2303,7 +2303,11 @@ class Scheduler:
         # whose load is in flight is not counted as prefillable work (and so a
         # FIRE is not spent on nothing). Local to this rank: no collective, and
         # nothing is scheduled for prefill here.
-        self._early_load_tier_prefixes()
+        if self._early_load_tier_prefixes():
+            # The first restore of a burst parks here, after the cap above was
+            # sized against no restore in flight; the delayer probes and the
+            # cost estimate below must see the slice.
+            self._tick_cold_partial_cap = self._pending_store_partial_cap()
 
         # should_allow_prefill() runs a cross-DP all_reduce and MUST be called
         # every tick on every rank for lockstep — hence before the early-return.
