@@ -395,6 +395,26 @@ impl LoadBalancingPolicy for CacheAwarePolicy {
         });
         let min_load = if min_load == usize::MAX { 0 } else { min_load };
 
+        // Soft session affinity: keep the session's worker unless it alone is over
+        // the balance thresholds against the least-loaded worker. Then the pool is
+        // imbalanced too, and the session moves to the least-loaded worker below.
+        if let Some(preferred) = info
+            .preferred_worker
+            .filter(|index| healthy_indices.contains(index))
+        {
+            let load = workers[preferred].load();
+            let overloaded = load.saturating_sub(min_load) > self.config.balance_abs_threshold
+                && (load as f32) > (min_load as f32 * self.config.balance_rel_threshold);
+            if !overloaded {
+                let tree = self.trees.get(&model_id).map(|entry| entry.value().clone());
+                if let (Some(text), Some(tree)) = (request_text, tree) {
+                    tree.insert(text, workers[preferred].url());
+                }
+                workers[preferred].increment_processed();
+                return (Some(preferred), RouteDecision::branch("session_preferred"));
+            }
+        }
+
         // Check if load is imbalanced
         let is_imbalanced = max_load.saturating_sub(min_load) > self.config.balance_abs_threshold
             && (max_load as f32) > (min_load as f32 * self.config.balance_rel_threshold);
@@ -530,6 +550,11 @@ impl LoadBalancingPolicy for CacheAwarePolicy {
 
     fn wants_tokens(&self) -> bool {
         self.kv_events.get().is_some()
+    }
+
+    /// Under soft affinity, moves a session off a worker over the balance thresholds.
+    fn overrides_session_affinity(&self) -> bool {
+        true
     }
 
     fn as_any(&self) -> &dyn std::any::Any {

@@ -84,6 +84,9 @@ struct StickyAssignment {
     dispatched: Option<WorkerIdentity>,
     /// Why the session was last reassigned, until a request is sent.
     reassigned: Option<&'static str>,
+    /// A request of the session failed on the worker it was sent to, so the
+    /// next request, a retry included, is placed again.
+    failed: bool,
 }
 
 #[derive(Debug, Default)]
@@ -109,10 +112,18 @@ impl SessionTable {
                 last_access: now,
                 dispatched: None,
                 reassigned: None,
+                failed: false,
             });
         entry.worker = worker;
         entry.last_access = now;
         entry.reassigned = reassigned;
+        entry.failed = false;
+    }
+
+    fn mark_failed(&self, key: &str) {
+        if let Some(mut entry) = self.assignments.get_mut(key) {
+            entry.failed = true;
+        }
     }
 
     fn touch(&self, key: &str, now: Instant) {
@@ -281,6 +292,13 @@ impl SessionAffinityPolicy {
         inner: Arc<dyn LoadBalancingPolicy>,
         scope: SessionAffinityScope,
     ) -> Self {
+        if config.mode == SessionAffinityMode::Soft && !inner.overrides_session_affinity() {
+            tracing::warn!(
+                policy = inner.name(),
+                scope = scope.as_str(),
+                "session-affinity mode is soft, but this policy keeps the bound worker; only cache_aware moves sessions"
+            );
+        }
         Self {
             config,
             ttl,
@@ -365,7 +383,7 @@ impl SessionAffinityPolicy {
 
     fn fresh_index(&self, key: &str, workers: &[Arc<dyn Worker>], now: Instant) -> Option<usize> {
         let assignment = self.table.assignments.get(key)?;
-        if self.is_expired(&assignment, now) {
+        if assignment.failed || self.is_expired(&assignment, now) {
             return None;
         }
         healthy_index(workers, &assignment.worker)
@@ -551,6 +569,20 @@ impl LoadBalancingPolicy for SessionAffinityPolicy {
             .record_dispatch(&key, WorkerIdentity::from_worker(worker))
         {
             MeshMetrics::record_session_worker_change(pool, reason);
+        }
+    }
+
+    /// A failed request releases its session's binding: the next request, a
+    /// retry included, is placed again and counts as `rebind`.
+    fn on_dispatch_failed(
+        &self,
+        pool: &'static str,
+        headers: Option<&http::HeaderMap>,
+        worker: &Arc<dyn Worker>,
+    ) {
+        self.inner.on_dispatch_failed(pool, headers, worker);
+        if let Some(key) = self.binding_key(headers) {
+            self.table.mark_failed(&key);
         }
     }
 
@@ -819,6 +851,105 @@ mod tests {
             changes,
             [r#"mesh_session_worker_change_total{pool="regular",reason="rebind"} 1"#]
         );
+    }
+
+    #[tokio::test]
+    async fn dispatch_failure_places_the_retry_again() {
+        let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        let _recorder = metrics::set_default_local_recorder(&recorder);
+        let policy = SessionAffinityPolicy::dp_sticky(SessionAffinityConfig::default());
+        let workers = workers();
+        let headers = header_map(&[("x-session-id", "session-1")]);
+        let info = info(&headers);
+
+        assert_eq!(policy.select_worker(&workers, &info).await, Some(0));
+        policy.on_dispatch("regular", Some(&headers), &workers[0]);
+        policy.on_dispatch_failed("regular", Some(&headers), &workers[0]);
+
+        // Worker 0 still counts the session, so fewest-session placement moves it.
+        let (retry, decision) = policy.select_with_decision(&workers, &info).await;
+        assert_eq!((retry, decision.branch), (Some(1), AFFINITY_REBIND));
+        policy.on_dispatch("regular", Some(&headers), &workers[1]);
+        let (next, decision) = policy.select_with_decision(&workers, &info).await;
+        assert_eq!((next, decision.branch), (Some(1), AFFINITY_HIT));
+
+        let changes: Vec<_> = handle
+            .render()
+            .lines()
+            .filter(|line| line.starts_with("mesh_session_worker_change_total{"))
+            .map(str::to_string)
+            .collect();
+        assert_eq!(
+            changes,
+            [r#"mesh_session_worker_change_total{pool="regular",reason="rebind"} 1"#]
+        );
+    }
+
+    #[tokio::test]
+    async fn soft_mode_lets_cache_aware_move_an_overloaded_session() {
+        for mode in [SessionAffinityMode::Hard, SessionAffinityMode::Soft] {
+            let cache_aware = Arc::new(crate::policies::CacheAwarePolicy::with_config(
+                crate::policies::CacheAwareConfig {
+                    cache_threshold: 0.5,
+                    balance_abs_threshold: 2,
+                    balance_rel_threshold: 1.5,
+                    eviction_interval_secs: 0,
+                    max_tree_size: 1000,
+                },
+            ));
+            let workers = workers();
+            cache_aware.init_workers(&workers);
+            let config = SessionAffinityConfig {
+                mode,
+                ..SessionAffinityConfig::default()
+            };
+            let policy = SessionAffinityPolicy::around(config, cache_aware.clone());
+            let headers = header_map(&[("x-session-id", "session-1")]);
+            let turn = |text: &'static str| SelectWorkerInfo {
+                request_text: Some(text),
+                headers: Some(&headers),
+                ..Default::default()
+            };
+
+            // Worker 1 is busier, so the first turn goes to worker 0.
+            workers[1].increment_load();
+            assert_eq!(policy.select_worker(&workers, &turn("a")).await, Some(0));
+
+            // Balanced: both modes keep the session.
+            let (kept, decision) = policy
+                .select_with_decision(&workers, &turn("abcdefghij"))
+                .await;
+            assert_eq!((kept, decision.branch), (Some(0), AFFINITY_HIT), "{mode:?}");
+            if mode == SessionAffinityMode::Soft {
+                // The kept turn reached the tree: a request without a session key
+                // matches its whole prompt on worker 0.
+                let probe = SelectWorkerInfo {
+                    request_text: Some("abcdefghij"),
+                    ..Default::default()
+                };
+                let (owner, decision) = cache_aware.select_with_decision(&workers, &probe).await;
+                assert_eq!((owner, decision.branch), (Some(0), "affinity"));
+            }
+
+            // Worker 0 is over both thresholds against worker 1.
+            for _ in 0..5 {
+                workers[0].increment_load();
+            }
+            let (selected, decision) = policy
+                .select_with_decision(&workers, &turn("abcdefghijk"))
+                .await;
+            match mode {
+                SessionAffinityMode::Hard => {
+                    assert_eq!((selected, decision.branch), (Some(0), AFFINITY_HIT));
+                    assert_eq!(policy.result_count(AFFINITY_REBIND), 0);
+                }
+                SessionAffinityMode::Soft => {
+                    assert_eq!((selected, decision.branch), (Some(1), "imbalanced"));
+                    assert_eq!(policy.result_count(AFFINITY_REBIND), 1);
+                }
+            }
+        }
     }
 
     #[tokio::test]

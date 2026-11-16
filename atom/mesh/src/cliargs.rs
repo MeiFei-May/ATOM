@@ -288,9 +288,9 @@ pub struct CliArgs {
     #[arg(long, default_value_t = 7200, help_heading = "Routing Policy")]
     pub session_affinity_ttl_secs: u64,
 
-    /// `hard` keeps the bound worker. `soft` is reserved for a policy that opts in
-    /// via `overrides_session_affinity`; no built-in policy does, so `soft`
-    /// currently keeps the binding as well.
+    /// `hard` keeps the bound worker. `soft` lets `cache_aware` move a session whose
+    /// worker is over `--balance-abs-threshold` and `--balance-rel-threshold` against
+    /// the least-loaded worker; other policies keep the binding.
     #[arg(
         long,
         default_value = "hard",

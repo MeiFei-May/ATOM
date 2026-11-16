@@ -151,8 +151,12 @@ The session key is the first non-empty header of `--session-id-headers`
 - `hit`: the pinned worker is healthy and its circuit breaker admits requests;
 - `new`: first request of the session; the policy places it, and `dp_sticky`
   picks the worker with the fewest live sessions, ties broken by load;
-- `rebind`: the pinned worker is unhealthy, removed or circuit-open, so the
-  session is placed again like a new one;
+- `rebind`: the pinned worker is unhealthy, removed or circuit-open, or the
+  session's last request to it failed with a server error or no response
+  (a retry included), so the session is placed again like a new one. With
+  `--session-affinity-mode soft`, `cache_aware` also rebinds a session whose
+  worker is over `--balance-abs-threshold` and `--balance-rel-threshold`
+  against the least-loaded worker;
 - `expired`: the session was idle for more than `--session-affinity-ttl-secs`
   (120 minutes) and is placed again.
 

@@ -137,11 +137,6 @@ impl SessionAffinityConfig {
                     .to_string(),
             });
         }
-        if self.mode == SessionAffinityMode::Soft {
-            tracing::warn!(
-                "session-affinity mode is soft, but no built-in policy overrides an existing binding; soft currently behaves as hard"
-            );
-        }
         Ok(())
     }
 }

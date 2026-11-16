@@ -67,6 +67,15 @@ impl LoadBalancingPolicy for DpStickyPolicy {
         self.inner.on_dispatch(pool, headers, worker);
     }
 
+    fn on_dispatch_failed(
+        &self,
+        pool: &'static str,
+        headers: Option<&http::HeaderMap>,
+        worker: &Arc<dyn Worker>,
+    ) {
+        self.inner.on_dispatch_failed(pool, headers, worker);
+    }
+
     fn name(&self) -> &'static str {
         "dp_sticky"
     }
