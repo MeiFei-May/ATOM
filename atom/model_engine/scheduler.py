@@ -134,6 +134,18 @@ _RELEASE_WEDGE_ATTEMPTS = 12
 # with at most this many rows left counts as a ready suffix, at most this many
 # are admitted ahead of cold prefill in one step, and cold prefill that made no
 # progress for this many steps while a suffix went first gets one step to itself.
+#
+# What the numbers trade (empirical values, not swept: no A/B over other values
+# was run; the 256c/512c runs in #3323 used these only):
+# - _READY_SUFFIX_MAX_TOKENS (4096): the size of "short". Raising it lets longer
+#   restored tails jump the queue, which frees their decode slots sooner but
+#   delays cold prefill (TTFT p90/p99 of cold requests) by up to that much per
+#   admitted suffix. Numerically equal to the default of
+#   ATOM_DP_PREFILL_BALANCE_MIN_TOKENS, but not derived from it.
+# - the Store's `pending_load_partial_token_cap` (8192, mooncake_store/scheduler.py)
+#   is the per-step token budget all running cold partials share while a restore
+#   is in flight. Lower: a pending restore waits behind less cold work, but
+#   cold prefill runs in smaller, less efficient forwards. Higher: the reverse.
 _READY_SUFFIX_MAX_TOKENS = 4096
 _READY_SUFFIX_PER_STEP = 4
 _READY_SUFFIX_COLD_STALL_STEPS = 3
@@ -3992,6 +4004,11 @@ class Scheduler:
                 return cap
         return 0
 
+    # The slice is soft for a forking partial: `_finalize_prefill_chunk` may
+    # widen a chunk to `min_fork_tokens` (a fork must fill its new state slot),
+    # so a partial can overshoot what is left of the cap by at most
+    # `min_fork_tokens - 1` (e.g. 130 for a 131-token fork). Ready-suffix admission bails while
+    # such a partial runs, so the overshoot never competes with a suffix.
     def _cold_slice_left(self, cold_tokens: int) -> int:
         return max(0, self._tick_cold_partial_cap - cold_tokens)
 
