@@ -489,8 +489,14 @@ class _StoreLookup(LookupClient):
 class MooncakeStoreOffloadScheduler(ChunkedOffloadSchedulerBase):
     """Chunked offload scheduling with the Mooncake Store as the tier."""
 
-    pending_load_partial_token_cap = 8192
-    ready_suffix_first = True
+    # Both are off unless ATOM_STORE_RESTORE_SCHED_PRIORITY is set.
+    @property
+    def pending_load_partial_token_cap(self) -> int:
+        return 8192 if envs.ATOM_STORE_RESTORE_SCHED_PRIORITY else 0
+
+    @property
+    def ready_suffix_first(self) -> bool:
+        return envs.ATOM_STORE_RESTORE_SCHED_PRIORITY
 
     # It answers `lookup_ready`, so the scheduler may start its loads early.
     supports_early_load = True

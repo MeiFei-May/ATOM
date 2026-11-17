@@ -2409,8 +2409,13 @@ class Scheduler:
         if self.cost_balance and delayer_allows and self.prefill_delayer is not None:
             self._balance_prefill_step(prefill_cost)
 
-        priority_tick, force_waiting_cold = self._ready_suffix_tick_plan(delayer_allows)
-        if delayer_allows and priority_tick:
+        ready_suffix = self._ready_suffix_enabled()
+        priority_tick, force_waiting_cold = True, False
+        if ready_suffix:
+            priority_tick, force_waiting_cold = self._ready_suffix_tick_plan(
+                delayer_allows
+            )
+        if ready_suffix and delayer_allows and priority_tick:
             num_seqs_prefill, num_batched_tokens = self._schedule_ready_short_prefills(
                 scheduled_seqs,
                 num_scheduled_tokens,
@@ -2857,7 +2862,7 @@ class Scheduler:
             # admits independent work without extending their deadlines.
             self.waiting.extendleft(reversed(prefix_waiters))
 
-        if delayer_allows:
+        if ready_suffix and delayer_allows:
             self._ready_suffix_tick_end(scheduled_seqs, num_scheduled_tokens)
 
         if self._num_parked_remote_kv > 0 and self._schedule_tick % 1000 == 0:
@@ -4040,12 +4045,10 @@ class Scheduler:
         On a priority tick ready suffixes are admitted first. After
         `_READY_SUFFIX_COLD_STALL_STEPS` steps in which cold prefill made no
         progress while a suffix went first, one tick is not a priority tick:
-        running ready suffixes are ordered last, and while the head of `waiting`
-        can be admitted, waiting ready suffixes sit the tick out in place."""
-        if (
-            not self._ready_suffix_enabled()
-            or self._ready_short_cold_stalls < _READY_SUFFIX_COLD_STALL_STEPS
-        ):
+        running ready suffixes are ordered after the cold partials. If the head
+        of `waiting` can be admitted that tick is forced cold: running ready
+        suffixes are skipped and waiting ones sit it out in place."""
+        if self._ready_short_cold_stalls < _READY_SUFFIX_COLD_STALL_STEPS:
             return True, False
         if not delayer_allows:
             return False, False
@@ -4071,8 +4074,6 @@ class Scheduler:
         self, scheduled_seqs: dict[int, Sequence], num_scheduled_tokens: list[int]
     ) -> None:
         """Count steps where a suffix went first and cold prefill got nothing."""
-        if not self._ready_suffix_enabled():
-            return
         cold_rows = sum(
             width
             for seq, width in zip(scheduled_seqs.values(), num_scheduled_tokens)
@@ -4138,8 +4139,6 @@ class Scheduler:
         `_READY_SUFFIX_PER_STEP`. `_ready_suffix_tick_plan` restores original
         ordering for one tick; decode HOLDs never consume this fairness clock.
         """
-        if not self._ready_suffix_enabled():
-            return num_seqs_prefill, num_batched_tokens
         if any(
             seq.is_partial_prefill
             and not seq.offload_loaded
@@ -4309,9 +4308,8 @@ class Scheduler:
         self._resume_prefill(seq, start, hit=replayed)
         chunk = self._finalize_prefill_chunk(seq, start, chunk)
         self._assert_positive_prefill_chunk(chunk, num_new_tokens, budget_remaining)
-        # This branch `continue`s past both assignments below, so the
-        # refresh happens here too: `_mark_offload_load_ready` raised
-        # `num_cached_tokens` to the post-load hit, and the stale field
+        # Refresh `prefix_cache_hit_tokens` here: `_mark_offload_load_ready`
+        # raised `num_cached_tokens` to the post-load hit, and the stale field
         # is what reaches the API as `cached_tokens` -- the tier would
         # look like it returned nothing. Unconditional, because a seq
         # re-admitted after `preempt()` keeps the field.
