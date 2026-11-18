@@ -207,6 +207,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_KV_OFFLOAD_EXTRA_CONFIG": lambda: os.getenv(
         "ATOM_KV_OFFLOAD_EXTRA_CONFIG", ""
     ),
+    # Store save pipeline: batches of at most this many 256-token keys are
+    # packed while the previous batch is put. 0 (default) saves serially.
+    "ATOM_STORE_SAVE_BATCH_CHUNKS": lambda: _int_env("ATOM_STORE_SAVE_BATCH_CHUNKS", 0),
     # --- Data Parallelism ---
     "ATOM_DP_RANK": lambda: int(os.getenv("ATOM_DP_RANK", "0")),
     "ATOM_DP_RANK_LOCAL": lambda: int(os.getenv("ATOM_DP_RANK_LOCAL", "0")),

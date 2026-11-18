@@ -23,8 +23,10 @@ Completion protocol, per worker and operation:
   source read deadline -- also claims the source quiescent and reports the
   chunks it never read as source-safe, so the scheduler may retry at once and
   every PP stage reports the same per-chunk set. An exception from the GPU
-  copy claims neither: it propagates, and ``_guard`` reports the failure
-  without the quiescent claim.
+  copy claims neither: a serial save lets it propagate, and ``_guard`` reports
+  the failure; a pipelined save (``ATOM_STORE_SAVE_BATCH_CHUNKS``) first
+  waits for its native puts, then claims the source quiescent only if a fresh
+  device fence proves it idle.
 * A chunk the store already holds when a save reaches its window is neither
   read nor put: it is source-safe at once and counts as stored, so a save
   whose every chunk was held ends in a success like any other.
@@ -50,7 +52,9 @@ import logging
 import threading
 import time
 from collections import Counter
-from collections.abc import Iterable, Iterator
+from collections.abc import Callable, Iterable, Iterator
+from dataclasses import dataclass
+from functools import partial
 from typing import Any
 
 import torch
@@ -68,8 +72,16 @@ from atom.kv_transfer.offload.kv_store.keys import DIGEST_BYTES, chunk_keys
 from atom.kv_transfer.offload.kv_store.pool import (
     Slot,
     SlotPoolExhausted,
+    SlotSettlement,
     TransferSlotPool,
     pool_allocation_bytes,
+)
+from atom.kv_transfer.offload.kv_store.save_pipeline import (
+    DuplicateSave,
+    Sender,
+    StreamStopped,
+    check_batch_chunks,
+    stream_chunks,
 )
 from atom.kv_transfer.offload.kv_store.scheduler import (
     monotonic_clock_id,
@@ -100,6 +112,13 @@ def _staging_buffer_bound() -> int:
     """
     bound = envs.OFFLOAD_GPU_STAGING_MAX_BYTES
     return _DEFAULT_GPU_STAGING_BYTES if bound is None else int(bound)
+
+
+@dataclass
+class _SaveProgress:
+    """The lowest chunk of a save handed to the GPU or found held so far."""
+
+    read_from: int = 0
 
 
 def _tp_group():
@@ -186,6 +205,13 @@ class KVStoreOffloadConnector(DenseOffloadConnector):
         # Why this worker loads nothing from the store any more, once it does
         # not: its own put (`_distrust_store`) or the backend's mark of it.
         self._store_distrusted: str | None = None
+        # The opt-in save pipeline; see `kv_store/save_pipeline.py`.
+        self._save_batch_chunks = envs.ATOM_STORE_SAVE_BATCH_CHUNKS
+        if self._save_batch_chunks:
+            check_batch_chunks(self._save_batch_chunks)
+            if self.chunk_size != 256:
+                raise ValueError("ATOM_STORE_SAVE_BATCH_CHUNKS needs 256-token keys")
+        self._sender = Sender(self, 2) if self._save_batch_chunks else None
         timeout = self._store_cfg.save_abandon_timeout_s
         self._source_read_window_s = timeout - min(
             _MAX_SOURCE_READ_MARGIN_S, timeout / 5
@@ -275,7 +301,7 @@ class KVStoreOffloadConnector(DenseOffloadConnector):
         raise NotImplementedError
 
     def _settle_put(
-        self, pool: TransferSlotPool, slots: list[Slot], answer: Any
+        self, pool: SlotSettlement, slots: list[Slot], answer: Any
     ) -> str | None:
         """Release or quarantine a put's slots; why it failed, None if stored."""
         raise NotImplementedError
@@ -330,7 +356,23 @@ class KVStoreOffloadConnector(DenseOffloadConnector):
         )
 
     def close(self) -> None:
-        """Join the executors, then release the GPU connector, pool and client."""
+        """Join the executors, then release the GPU connector, pool and client.
+
+        With the save pipeline the sender gets a bounded wait first. If a put
+        is still native, the owners stay open (it may use the registered
+        buffers) and the save executor is not joined: its thread waits in
+        ``drain_request``. Its threads are non-daemon, so the interpreter
+        joins them at exit; a second ``close`` releases everything.
+        """
+        if self._sender is not None:
+            for executor in (self._save_executor, self._load_executor):
+                executor.shutdown(wait=False)
+            if not self._sender.close():
+                logger.warning(
+                    "%s: the save sender is still busy; resources stay open",
+                    self.LABEL,
+                )
+                return
         super().close()
         # A backend's own call still inside the client keeps it open: closing
         # it would pull it from under the call.
@@ -535,28 +577,41 @@ class KVStoreOffloadConnector(DenseOffloadConnector):
 
     def _save_segments(
         self,
-        client: KVStoreClient,
+        start_lookup: Callable[[list[str]], Any],
+        finish_lookup: Callable[[Any], list[int]],
         req: LMCacheReqMeta,
         windows: list[range],
     ) -> Iterator[tuple[range, bool, list[str], float | None]]:
         """``windows`` in runs of chunks the store holds or not, highest first.
 
         Per run: its chunks, whether the store holds them, their keys and the
-        milliseconds the lookup took, on a window's first run only (None on
-        the rest). One
-        lookup per window, made when the save reaches it. Another request's
+        milliseconds the lookup took (the wait for its answer), on a window's
+        first run only (None on the rest). One lookup per window, made when
+        the save reaches it. Another request's
         save often stored a prefix already -- the scheduler's lookup counts
         only the prefix every rank holds, so a save starts below what this
         rank has -- and putting it again would pack and send bytes the store
         then drops. A lookup that fails, or a key it has no answer for, holds
         nothing: the chunk is put as it would be without a lookup. The client
         answers one code per key or raises (`KVStoreClient.exists`).
+
+        The next window's lookup starts before this window's runs are
+        yielded: queued on the pipeline's sender behind this window's last
+        put, it would keep the next window from packing meanwhile. A stopped
+        sender (`StreamStopped`) ends the save; it is no lookup failure.
         """
-        for window in windows:
+        ahead = None
+        for index, window in enumerate(windows):
             keys = self._window_keys(req, window)
             t0 = time.perf_counter()
             try:
-                held = [answer == 1 for answer in client.exists(keys)]
+                lookup = start_lookup(keys) if ahead is None else ahead
+                ahead = None
+                if index + 1 < len(windows):
+                    ahead = start_lookup(self._window_keys(req, windows[index + 1]))
+                held = [answer == 1 for answer in finish_lookup(lookup)]
+            except StreamStopped:
+                raise
             except Exception as exc:  # noqa: BLE001  # the window is put whole
                 self._warn_rate_limited(
                     "save:exists_failed",
@@ -576,6 +631,53 @@ class KVStoreOffloadConnector(DenseOffloadConnector):
                 lookup_ms = None
 
     def _do_save_req(self, req: LMCacheReqMeta, *, producer_event=None) -> None:
+        sender = self._sender
+        progress = _SaveProgress()
+        if sender is None:
+            return self._save(req, None, progress, producer_event)
+        try:
+            sender.begin_request(req, self._save_batch_chunks)
+        except DuplicateSave:
+            # The invocation already active owns this operation's reports.
+            logger.warning(
+                "%s: duplicate active save operation %s", self.LABEL, req.save_operation
+            )
+            return
+        try:
+            self._save(req, sender, progress, producer_event)
+        except Exception as exc:  # noqa: BLE001  # drain native work, then fail
+            # Cancel the batches not yet put and wait for those that are, so no
+            # native call outlives the terminal. Chunks from `read_from` up were
+            # reported as their copies finished; the rest are reported only if
+            # a fresh device fence proves nothing still reads them.
+            sender.cancel(req)
+            sender.release_preparing()
+            sender.drain_request(req)
+            self._warn_rate_limited(
+                "save:stream_exception",
+                "%s: a pipelined save failed (%r), req=%s; native work has drained",
+                self.LABEL,
+                exc,
+                req.req_id,
+            )
+            try:
+                _synchronize(self._registered()[0].device)
+            except Exception:  # noqa: BLE001  # a failed fence cannot free the source
+                self._record_save_failure(req, source_quiescent=False)
+            else:
+                start = int(req.save_spec.skip_leading_tokens) // self.chunk_size
+                self._abort_save(req, range(start, progress.read_from))
+        finally:
+            sender.release_preparing()
+            sender.forget_request(req)
+
+    def _save(
+        self,
+        req: LMCacheReqMeta,
+        sender: Sender | None,
+        progress: _SaveProgress,
+        producer_event,
+    ) -> None:
         ss = req.save_spec
         assert ss is not None
         self._pin_in_place_stream()
@@ -593,13 +695,21 @@ class KVStoreOffloadConnector(DenseOffloadConnector):
         )
         # The lowest chunk handed to the GPU or found held so far; [start,
         # read_from) is unread.
-        read_from = end
+        progress.read_from = read_from = end
         failure = detail = None
         segments_run = put_bytes = in_place_segments = 0
         windows_reached = put_chunks = held_chunks = 0
         pack_ms = put_ms = exists_ms = 0.0
         t_store0 = time.perf_counter()
-        for segment, held, keys, lookup_ms in self._save_segments(client, req, windows):
+        if sender is None:
+            start_lookup, finish_lookup = list, client.exists
+        else:
+            start_lookup = partial(sender.start_lookup, client)
+            finish_lookup = sender.finish_lookup
+        segments = self._save_segments(start_lookup, finish_lookup, req, windows)
+        if sender is not None:
+            segments = stream_chunks(segments, sender.batch_size(req))
+        for segment, held, keys, lookup_ms in segments:
             if lookup_ms is not None:  # the first segment of a window
                 windows_reached += 1
                 exists_ms += lookup_ms
@@ -607,9 +717,15 @@ class KVStoreOffloadConnector(DenseOffloadConnector):
                 # Already in the store: neither read nor put, and source-safe
                 # at once, highest first like the rest.
                 self._chunks_source_safe(req.save_operation, reversed(segment))
-                read_from = segment.start
+                progress.read_from = read_from = segment.start
                 held_chunks += len(segment)
                 continue
+            if sender is not None:
+                try:
+                    sender.reserve(req, len(segment))
+                except StreamStopped as exc:
+                    failure, detail = "stream_stopped", str(exc)
+                    break
             try:
                 slots = pool.acquire("save", len(segment))
             except SlotPoolExhausted as exc:
@@ -651,11 +767,14 @@ class KVStoreOffloadConnector(DenseOffloadConnector):
             pack_ms += (time.perf_counter() - t_pack0) * 1000
             # Both paths return after their final stream sync: no GPU work of
             # this segment still reads the source or writes the slots.
-            read_from = segment.start
+            progress.read_from = read_from = segment.start
             if run is not None:
                 in_place_segments += 1
                 # Highest first, as the block GPU connector reports them.
                 self._chunks_source_safe(req.save_operation, reversed(segment))
+            if sender is not None:
+                sender.submit(req, segment, keys, slots)
+                continue
             t_put0 = time.perf_counter()
             try:
                 answer = self._put_chunks(client, req, segment, keys, slots)
@@ -676,6 +795,14 @@ class KVStoreOffloadConnector(DenseOffloadConnector):
                 failure, detail = "put_failed", problem
                 break
             put_bytes += self._chunk_bytes * len(slots)
+        if sender is not None:
+            sender.release_preparing()
+            completed = sender.drain_request(req)
+            put_ms = completed.native_ms
+            put_chunks = completed.returned_chunks
+            put_bytes = self._chunk_bytes * completed.stored_chunks
+            if completed.problem is not None and failure in (None, "stream_stopped"):
+                failure, detail = "put_failed", completed.problem
         with self._stats_lock:
             self._save_counts["put_chunks"] += put_chunks
             self._save_counts["held_chunks"] += held_chunks

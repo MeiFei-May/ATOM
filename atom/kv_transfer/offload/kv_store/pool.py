@@ -22,7 +22,7 @@ import logging
 import threading
 from collections import deque
 from itertools import pairwise
-from typing import Any
+from typing import Any, Protocol
 
 import torch
 
@@ -81,6 +81,15 @@ def pool_allocation_bytes(save_bytes: int, load_bytes: int) -> int:
     when no chunk size is known yet (``kv_budget_reserve_bytes``).
     """
     return int(save_bytes) + int(load_bytes) + _BASE_ALIGN
+
+
+class SlotSettlement(Protocol):
+    """What a settlement hook (``_settle_put``) may do to a put's slots: the
+    pool does it at once, the save pipeline's transaction after the hook."""
+
+    def release(self, slots: list[Slot]) -> None: ...
+
+    def quarantine(self, slots: list[Slot], *, reason: str = ...) -> None: ...
 
 
 class TransferSlotPool:
@@ -399,6 +408,7 @@ __all__ = [
     "REGIONS",
     "Slot",
     "SlotPoolExhausted",
+    "SlotSettlement",
     "TransferSlotPool",
     "pool_allocation_bytes",
 ]
