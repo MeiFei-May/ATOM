@@ -1380,6 +1380,28 @@ def _completed_match(scheduler, seq):
     return scheduler.get_num_new_matched_tokens(seq)
 
 
+def test_ready_suffix_flag_is_read_once_at_construction(cluster, monkeypatch):
+    # A real Store scheduler: building it, one lookup (a tick's Store work) and
+    # the property the engine scheduler asks every tick. A missing `envs` import
+    # in the module would raise NameError at construction.
+    for raw, expected in ((None, False), ("0", False), ("1", True)):
+        if raw is None:
+            monkeypatch.delenv("ATOM_STORE_RESTORE_SCHED_PRIORITY", raising=False)
+        else:
+            monkeypatch.setenv("ATOM_STORE_RESTORE_SCHED_PRIORITY", raw)
+        scheduler = MooncakeStoreOffloadScheduler(_config())
+        scheduler._min_load_tokens = 0
+        assert scheduler.ready_suffix_first is expected
+        assert (
+            Scheduler._ready_suffix_enabled(SimpleNamespace(kv_connector=scheduler))
+            is expected
+        )
+        assert _completed_match(scheduler, _seq(1, 41)) == (0, False)
+    # Later changes of the environment do not reach a built scheduler.
+    monkeypatch.setenv("ATOM_STORE_RESTORE_SCHED_PRIORITY", "0")
+    assert scheduler.ready_suffix_first is True
+
+
 def test_scheduler_opens_its_store_client_on_the_first_lookup(cluster):
     scheduler = MooncakeStoreOffloadScheduler(_config())
     scheduler._min_load_tokens = 0

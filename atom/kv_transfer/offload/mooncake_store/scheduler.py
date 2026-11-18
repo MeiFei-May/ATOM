@@ -383,15 +383,6 @@ class _StoreLookup(StoreLookupBase):
 class MooncakeStoreOffloadScheduler(KVStoreOffloadScheduler):
     """Chunked offload scheduling with the Mooncake Store as the tier."""
 
-    # Both are off unless ATOM_STORE_RESTORE_SCHED_PRIORITY is set.
-    @property
-    def pending_load_partial_token_cap(self) -> int:
-        return 8192 if envs.ATOM_STORE_RESTORE_SCHED_PRIORITY else 0
-
-    @property
-    def ready_suffix_first(self) -> bool:
-        return envs.ATOM_STORE_RESTORE_SCHED_PRIORITY
-
     LABEL = "Mooncake Store offload"
     # It answers `lookup_ready`, so the scheduler may start its loads early.
     supports_early_load = True
@@ -418,6 +409,9 @@ class MooncakeStoreOffloadScheduler(KVStoreOffloadScheduler):
             ),
             endpoint="masters=" + ",".join(pool.master for pool in cfg.store_masters()),
         )
+        # Read once: `envs` re-reads the environment on every access, and the
+        # scheduler asks on every tick.
+        self.ready_suffix_first = envs.ATOM_STORE_RESTORE_SCHED_PRIORITY
         # The Store reads whole chunks into fresh blocks, so an HBM hit that
         # ends inside a chunk is lowered to the chunk floor
         # (`BlockManager.lower_hit_to_chunk`). The registry holds the flag, one

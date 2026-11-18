@@ -5,12 +5,10 @@ from copy import deepcopy
 from types import SimpleNamespace
 
 from atom.kv_transfer.disaggregation.base import KVConnectorSchedulerBase
-from atom.kv_transfer.offload.mooncake_store.scheduler import (
-    MooncakeStoreOffloadScheduler,
-)
 from atom.model_engine.block_manager import BlockManager
 from atom.model_engine.scheduler import Scheduler
 from atom.model_engine.sequence import Replay, SequenceStatus
+from atom.utils import envs
 
 
 class ConnectorView(SimpleNamespace, KVConnectorSchedulerBase):
@@ -53,7 +51,6 @@ def fixture():
     s._tick_cost = 0
     s._balance_token_weight = 0
     s._balance_min_tokens = 4096
-    s._tick_cold_partial_cap = 0
     s._checkpoint_holds = {}
     s.long_prefill_token_threshold = 0
     s.enable_chunked_prefill = True
@@ -61,9 +58,7 @@ def fixture():
     s.replay_history_tokens = 3
     s.advance_on_schedule = False
     s.delay_factor = 0
-    s.kv_connector = ConnectorView(
-        is_offload=True, pending_load_partial_token_cap=8192, ready_suffix_first=True
-    )
+    s.kv_connector = ConnectorView(is_offload=True, ready_suffix_first=True)
     s._early_load = SimpleNamespace(
         entries={}, note_prefill=lambda sid: ledger.append(("prefill", sid))
     )
@@ -139,9 +134,9 @@ def test_actual_terminal_resolves_and_admits_before_cold():
     other.num_cached_tokens = 90000
     other.num_tokens = 100000
     for seq in (cold, other):
-        result = s._schedule_running_partial(seq, selected, widths, n, used, 0)
+        result = s._schedule_running_partial(seq, selected, widths, n, used)
         if result is not None:
-            n, used, _ = result
+            n, used = result
     assert list(selected) == [2, 1, 3]
     assert widths == [338, 128, 3568]
     assert (
@@ -149,10 +144,7 @@ def test_actual_terminal_resolves_and_admits_before_cold():
     )  # over the cost target only up to the floor
 
 
-def test_ready_suffix_switch_is_not_the_cold_slice_cap():
-    s, _ready, _cold, _ = fixture()
-    s.kv_connector.pending_load_partial_token_cap = 0
-    assert capture_schedule(schedule_fixture(s), 64_000_000)["ids"][0] == 2
+def test_ready_suffix_switch_turns_the_priority_off():
     s, _ready, _cold, _ = fixture()
     s.kv_connector.ready_suffix_first = False
     assert capture_schedule(schedule_fixture(s), 64_000_000)["ids"] == [1]
@@ -210,7 +202,7 @@ def test_actual_ready_floor_exception_stops_other_ready_and_cold():
     assert s._tick_cost > s._tick_cost_limit  # Existing ready floor, not a new target.
     assert list(s.waiting) == [other] and s._ready_short_admitted == 1
     # The floor still holds: cold takes what is left of it, no more.
-    _, used, _ = s._schedule_running_partial(cold, selected, widths, n, used, 0)
+    _, used = s._schedule_running_partial(cold, selected, widths, n, used)
     assert used <= s._balance_min_tokens
 
 
@@ -446,40 +438,6 @@ def test_forced_cold_tick_probe_does_not_start_the_lookup_defer_clock():
     assert calls == []
 
 
-def test_first_restore_parked_this_tick_slices_the_running_cold_partial():
-    s, _, cold, _ = fixture()
-    schedule_fixture(s)
-    s.finished_recving_kv_req_ids = []
-    s._num_parked_remote_kv = 0  # nothing in flight when the tick starts
-
-    def early_load():
-        s._num_parked_remote_kv = 1  # the first restore is parked now
-        return 1
-
-    s._early_load_tier_prefixes = early_load
-    s._still_loading = lambda seq: True
-    s._chunk_alignment = lambda: 128
-    result = capture_schedule(s)
-    assert result["ids"][0] == cold.id
-    assert result["widths"][0] == 8192  # not the whole 32768 budget
-
-
-def test_cold_slice_remainder_is_floored_to_the_grid_not_taken_as_a_final_chunk():
-    s, _, cold, _ = fixture()
-    s._tick_cold_partial_cap = 8192
-    s._chunk_alignment = lambda: 128
-    s._prefill_room = lambda batched, start: 32768 - batched
-
-    def chunk(spent):
-        return s._partial_prefill_chunk(
-            cold, 0, 0, spent, cap_from=0, cold_tokens=spent
-        )
-
-    assert chunk(0) == 8192
-    assert chunk(8192 - 1000) == 896  # floored onto the grid, not 1000
-    assert chunk(8192 - 92) == 0  # under one aligned unit: no 92-row sliver
-
-
 def test_active_cold_fork_retains_original_path_instead_of_overfilling_new_budget():
     s, ready, cold, _ = fixture()
     cold.state_fork_src = 99
@@ -498,22 +456,17 @@ def test_active_cold_fork_retains_original_path_instead_of_overfilling_new_budge
     assert list(selected) == [2] and widths == [338]
 
 
-class StoreFlagView(ConnectorView):
-    """The Store scheduler's own policy properties, on a connector stub."""
-
-    pending_load_partial_token_cap = (
-        MooncakeStoreOffloadScheduler.pending_load_partial_token_cap
-    )
-    ready_suffix_first = MooncakeStoreOffloadScheduler.ready_suffix_first
-
-
 def store_flag_fixture(monkeypatch, value):
     if value is None:
         monkeypatch.delenv("ATOM_STORE_RESTORE_SCHED_PRIORITY", raising=False)
     else:
         monkeypatch.setenv("ATOM_STORE_RESTORE_SCHED_PRIORITY", value)
     s, _ready, cold, _ = fixture()
-    s.kv_connector = StoreFlagView(is_offload=True)
+    # The flag is read when the Store scheduler is built (see
+    # test_mooncake_store_offload.py::test_ready_suffix_flag_is_read_once_...).
+    s.kv_connector = ConnectorView(
+        is_offload=True, ready_suffix_first=envs.ATOM_STORE_RESTORE_SCHED_PRIORITY
+    )
     cold.num_tokens = 128
     other = deepcopy(cold)
     other.id = 3
@@ -524,21 +477,10 @@ def store_flag_fixture(monkeypatch, value):
     return schedule_fixture(s)
 
 
-def test_store_restore_flag_defaults_off_and_is_read_lazily(monkeypatch):
-    monkeypatch.delenv("ATOM_STORE_RESTORE_SCHED_PRIORITY", raising=False)
-    s = StoreFlagView(is_offload=True)
-    assert (s.pending_load_partial_token_cap, s.ready_suffix_first) == (0, False)
-    monkeypatch.setenv("ATOM_STORE_RESTORE_SCHED_PRIORITY", "1")
-    assert (s.pending_load_partial_token_cap, s.ready_suffix_first) == (8192, True)
-    monkeypatch.setenv("ATOM_STORE_RESTORE_SCHED_PRIORITY", "0")
-    assert (s.pending_load_partial_token_cap, s.ready_suffix_first) == (0, False)
-
-
 def test_flag_off_admission_order_is_main(monkeypatch):
     # The same state as the multi-cold test above, whose flag-on order is
     # [2, 1, 3]. Off, the restored request is admitted by Phase 2 after the
-    # running cold partials, in main's order, with no cold slice: the cold
-    # partial takes the whole batch budget.
+    # running cold partials, in main's order.
     s = store_flag_fixture(monkeypatch, None)
     for name in (
         "_ready_suffix_tick_plan",
@@ -552,7 +494,7 @@ def test_flag_off_admission_order_is_main(monkeypatch):
         )
     result = capture_schedule(s, 64_000_000)
     assert result["ids"] == [1, 3] and result["widths"] == [128, 3952]
-    assert s._tick_cold_partial_cap == 0 and result["priority"] == 0
+    assert result["priority"] == 0
 
 
 def test_flag_on_admission_order_is_ready_first(monkeypatch):

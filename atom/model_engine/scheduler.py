@@ -142,10 +142,10 @@ _RELEASE_WEDGE_ATTEMPTS = 12
 #   delays cold prefill (TTFT p90/p99 of cold requests) by up to that much per
 #   admitted suffix. Numerically equal to the default of
 #   ATOM_DP_PREFILL_BALANCE_MIN_TOKENS, but not derived from it.
-# - the Store's `pending_load_partial_token_cap` (8192, mooncake_store/scheduler.py)
-#   is the per-step token budget all running cold partials share while a restore
-#   is in flight. Lower: a pending restore waits behind less cold work, but
-#   cold prefill runs in smaller, less efficient forwards. Higher: the reverse.
+# - _READY_SUFFIX_PER_STEP (4) and _READY_SUFFIX_COLD_STALL_STEPS (3): how many
+#   suffixes may go first in one step, and how long cold prefill may be starved
+#   before it gets one step to itself. More / longer: lower restore latency, a
+#   heavier cold-prefill tail. Fewer / shorter: the reverse.
 _READY_SUFFIX_MAX_TOKENS = 4096
 _READY_SUFFIX_PER_STEP = 4
 _READY_SUFFIX_COLD_STALL_STEPS = 3
@@ -744,7 +744,6 @@ class Scheduler:
         # see `_prefill_room`.
         self._tick_cost_limit = math.inf
         self._tick_cost = 0.0
-        self._tick_cold_partial_cap = 0
         self._ready_short_admitted = 0
         self._ready_short_cold_stalls = 0
         # steps, tokens, own cost, target, steps shrunk
@@ -1174,7 +1173,6 @@ class Scheduler:
     def _probe_local_prefill_work(self) -> tuple[bool, int]:
         budget = self.max_num_batched_tokens
         pending = 0
-        cold_tokens = 0
         if self._partial_prefill_count:
             for seq in self.running:
                 if not seq.is_partial_prefill:
@@ -1190,15 +1188,10 @@ class Scheduler:
                     resume,
                     pending,
                     cap_from=max(resume, seq.replay_until),
-                    cold_tokens=cold_tokens,
                 )
                 if not chunk:
-                    if self._slice_cold_partial(seq, start, resume):
-                        continue  # its slice is spent; later partials may fit
                     break
                 chunk = self._preview_prefill_chunk(seq, start, resume, chunk)
-                if self._slice_cold_partial(seq, start, resume):
-                    cold_tokens += chunk
                 pending += chunk
                 if pending >= budget:
                     break
@@ -1257,7 +1250,7 @@ class Scheduler:
             slots -= 1
             # The resume just consumed its virtual running slot; do not also
             # reserve that same request in the fresh-admission parked count.
-            if offload_resume and seq._counted_as_inflight_load:
+            if offload_resume and getattr(seq, "_counted_as_inflight_load", False):
                 parked -= 1
             if pending >= budget:
                 return True, budget
@@ -1385,7 +1378,6 @@ class Scheduler:
         estimate -- the real admission may park or skip some of these seqs."""
         token_cap = self.max_num_batched_tokens
         tokens, cost = 0, 0.0
-        cold_tokens = 0
         if self._partial_prefill_count > 0:
             for seq in self.running:
                 if not seq.is_partial_prefill:
@@ -1400,13 +1392,8 @@ class Scheduler:
                         - seq.num_cached_tokens
                     )
                 k = min(remaining, token_cap - tokens)
-                resume = seq.num_cached_tokens
-                start = self.block_manager.replay_start(seq, resume, hit=False)
-                if self._slice_cold_partial(seq, start, resume):
-                    k = min(k, self._cold_slice_left(cold_tokens))
-                    cold_tokens += k
                 if k <= 0:
-                    continue
+                    return cost
                 cost += self._chunk_cost(seq.num_cached_tokens, k)
                 tokens += k
         for seq in itertools.islice(self._waiting_prefills(), self.max_num_seqs):
@@ -1472,7 +1459,6 @@ class Scheduler:
         batched_tokens: int,
         *,
         cap_from: int | None = None,
-        cold_tokens: int = 0,
     ) -> int:
         """The next chunk of a running prefill that resumes at `resume` and
         starts at `start`, or 0. A chunk ending at or below `resume` only
@@ -1485,14 +1471,9 @@ class Scheduler:
         remaining = seq.num_tokens - start
         if 0 < self.long_prefill_token_threshold < seq.num_tokens - cap_from:
             remaining = self.long_prefill_token_threshold + cap_from - start
-        room = self._prefill_room(batched_tokens, start)
-        if self._slice_cold_partial(seq, start, resume):
-            # Limit the budget, not `remaining`: a request's own remainder is
-            # what tells a final chunk (exempt from alignment) from a cut one.
-            room = min(room, self._cold_slice_left(cold_tokens))
         chunk = self._chunked_prefill_size(
             remaining,
-            room,
+            self._prefill_room(batched_tokens, start),
             batched_tokens,
             history_len=start,
             kind=ChunkKind.NEXT,
@@ -2298,7 +2279,6 @@ class Scheduler:
         # balancing decision and must not see the previous step's cost limit.
         self._tick_cost_limit = math.inf
         self._tick_cost = 0.0
-        self._tick_cold_partial_cap = 0
         self._ready_short_admitted = 0
         skipped_waiting_requests: deque[Sequence] = deque()
         ready_deferred: deque[Sequence] = deque()
@@ -2307,7 +2287,6 @@ class Scheduler:
 
         self._prioritize_ready_remote_kv_requests()
         self._park_ready_offload_partial_prefills()
-        self._tick_cold_partial_cap = self._pending_store_partial_cap()
         # Reclaim aborted heads even when decode protection vetoes Phase 2.
         while self.waiting and self.waiting[0].status == SequenceStatus.ABORTED:
             self._finish_rejected_waiting(self.waiting.popleft())
@@ -2327,11 +2306,7 @@ class Scheduler:
         # whose load is in flight is not counted as prefillable work (and so a
         # FIRE is not spent on nothing). Local to this rank: no collective, and
         # nothing is scheduled for prefill here.
-        if self._early_load_tier_prefixes():
-            # The first restore of a burst parks here, after the cap above was
-            # sized against no restore in flight; the delayer probes and the
-            # cost estimate below must see the slice.
-            self._tick_cold_partial_cap = self._pending_store_partial_cap()
+        self._early_load_tier_prefixes()
 
         # should_allow_prefill() runs a cross-DP all_reduce and MUST be called
         # every tick on every rank for lockstep — hence before the early-return.
@@ -2442,7 +2417,6 @@ class Scheduler:
         # Phase 2 in lockstep. Inside that, skip the running-queue scan entirely
         # when no seq is mid-prefill — the common steady-state decode case —
         # using the counter maintained by postprocess / preempt / finished-removal.
-        cold_partial_tokens = 0
         if delayer_allows and self._partial_prefill_count > 0:
             partial_order = self.running
             if not priority_tick:
@@ -2467,11 +2441,10 @@ class Scheduler:
                     num_scheduled_tokens,
                     num_seqs_prefill,
                     num_batched_tokens,
-                    cold_partial_tokens,
                 )
                 if resumed is None:
                     break
-                num_seqs_prefill, num_batched_tokens, cold_partial_tokens = resumed
+                num_seqs_prefill, num_batched_tokens = resumed
 
         # ---- Phase 2: new requests from waiting ----
         prefix_waiters: deque[Sequence] = deque()
@@ -3302,7 +3275,7 @@ class Scheduler:
             self.pd_admission.cancel(seq)
         self._inflight_prefix_wait.pop(seq.id, None)
         self._lookup_detach_declined.discard(seq.id)
-        has_inflight_load = seq._counted_as_inflight_load
+        has_inflight_load = bool(getattr(seq, "_counted_as_inflight_load", False))
         seq.status = SequenceStatus.FINISHED
         seq.leave_reason = reason
         seq.multimodal_data = None
@@ -3998,50 +3971,6 @@ class Scheduler:
                 num_offload_tokens=offload_tokens,
             )
 
-    def _pending_store_partial_cap(self) -> int:
-        """Bound cold GPU work only while a Store restore is really in flight."""
-        cap = (
-            self.kv_connector.pending_load_partial_token_cap
-            if self.kv_connector is not None
-            else 0
-        )
-        if not cap or not self._partial_prefill_count or not self._num_parked_remote_kv:
-            return 0
-        cap = min(int(cap), self.max_num_batched_tokens)
-        alignment = self._chunk_alignment()
-        cap = cap // alignment * alignment
-        if cap <= 0:
-            return 0
-        for seq in self.waiting:
-            if (
-                seq._counted_as_inflight_load
-                and len(seq.block_table) > 0
-                and self._still_loading(seq)
-                and not seq.offload_loaded
-                and not seq.offload_load_failed
-            ):
-                return cap
-        return 0
-
-    # The slice is soft for a forking partial: `_finalize_prefill_chunk` may
-    # widen a chunk to `min_fork_tokens` (a fork must fill its new state slot),
-    # so a partial can overshoot what is left of the cap by at most
-    # `min_fork_tokens - 1` (e.g. 130 for a 131-token fork). Ready-suffix admission bails while
-    # such a partial runs, so the overshoot never competes with a suffix.
-    def _cold_slice_left(self, cold_tokens: int) -> int:
-        return max(0, self._tick_cold_partial_cap - cold_tokens)
-
-    def _slice_cold_partial(self, seq: Sequence, start: int, resume: int) -> bool:
-        # Do not shrink replay or a rollback needed to produce final logits.
-        # The existing replay progress/alignment rules retain full control.
-        return bool(
-            self._tick_cold_partial_cap
-            and seq.is_partial_prefill
-            and start == resume
-            and seq.replay_until <= resume
-            and not seq.offload_loaded
-        )
-
     # ---- Ready-suffix priority -------------------------------------------
     # A request whose Store restore finished needs only a short suffix before
     # it decodes; running that ahead of cold prefill frees its slot sooner. All
@@ -4178,11 +4107,10 @@ class Scheduler:
                 num_scheduled_tokens,
                 num_seqs_prefill,
                 num_batched_tokens,
-                0,
             )
             if resumed is None:
                 break
-            num_seqs_prefill, num_batched_tokens, _ = resumed
+            num_seqs_prefill, num_batched_tokens = resumed
             self._ready_short_admitted += 1
 
         if self.delay_factor > 0 and not self._passed_delay(time.time()):
@@ -4220,8 +4148,7 @@ class Scheduler:
         num_scheduled_tokens: list[int],
         num_seqs_prefill: int,
         num_batched_tokens: int,
-        cold_partial_tokens: int,
-    ) -> tuple[int, int, int] | None:
+    ) -> tuple[int, int] | None:
         """One existing Phase1 partial; no queue insertion or new allocation."""
         resume = seq.num_cached_tokens
         start = self.block_manager.replay_start(seq, resume, hit=False)
@@ -4231,25 +4158,19 @@ class Scheduler:
             resume,
             num_batched_tokens,
             cap_from=max(resume, seq.replay_until),
-            cold_tokens=cold_partial_tokens,
         )
         if chunk:
             self._resume_prefill(seq, start, hit=False)
             chunk = self._finalize_prefill_chunk(seq, start, chunk)
         if chunk <= 0:
-            if self._slice_cold_partial(seq, start, resume):
-                # Its slice is spent: skip it, later partials may still fit.
-                return num_seqs_prefill, num_batched_tokens, cold_partial_tokens
             return None
-        if self._slice_cold_partial(seq, start, resume):
-            cold_partial_tokens += chunk
         self._tick_cost += self._chunk_cost(seq.num_cached_tokens, chunk)
         num_batched_tokens += chunk
         num_seqs_prefill += 1
         seq.type = SequenceType.PREFILL
         scheduled_seqs[seq.id] = seq
         num_scheduled_tokens.append(chunk)
-        return num_seqs_prefill, num_batched_tokens, cold_partial_tokens
+        return num_seqs_prefill, num_batched_tokens
 
     def _schedule_offload_prefill_resume(
         self,
@@ -4263,18 +4184,17 @@ class Scheduler:
         # Blocks already held from the pre-park allocate; only re-check
         # the batch budget. No re-match / re-allocate / re-park.
         #
-        # `num_tokens`, like Phase 1 above and the non-offload branch
-        # below. A seq re-admitted after `preempt` owes KV for the
-        # tokens it had already generated, and the offload load can
-        # come back covering some of them -- `_mark_offload_load_ready`
-        # sets `num_cached_tokens` to whatever the tier returned, which
-        # is not bounded by the prompt. Sized against
+        # Sized against `num_tokens`, as every other prefill is. A seq
+        # re-admitted after `preempt` owes KV for the tokens it had already
+        # generated, and the offload load can come back covering some of them
+        # -- `_mark_offload_load_ready` sets `num_cached_tokens` to whatever
+        # the tier returned, which is not bounded by the prompt. Sized against
         # `num_prompt_tokens` that is a non-positive width:
-        # `_prefill_chunk_for_budget` answers None, the seq goes back
-        # to the head of `waiting`, and the loop breaks -- every tick,
-        # forever, starving everything queued behind it. With chunked
-        # prefill off it is `_assert_positive_prefill_chunk` that fires
-        # instead, in the engine loop.
+        # `_prefill_chunk_for_budget` answers None, the seq goes back to the
+        # head of `waiting`, and the loop breaks -- every tick, forever,
+        # starving everything queued behind it. With chunked prefill off it is
+        # `_assert_positive_prefill_chunk` that fires instead, in the engine
+        # loop.
         tier_hit = seq.num_cached_tokens
         if seq.num_tokens <= tier_hit:
             # The tier can cover the request whole: its lookup runs
@@ -4914,14 +4834,14 @@ class Scheduler:
         self._count_inflight_load(seq)
 
     def _count_inflight_load(self, seq: Sequence) -> None:
-        if not seq._counted_as_inflight_load:
+        if not getattr(seq, "_counted_as_inflight_load", False):
             if metrics := getattr(self, "metrics", None):
                 metrics.start_kv_wait(seq)
             self._num_parked_remote_kv += 1
             seq._counted_as_inflight_load = True
 
     def _uncount_inflight_load(self, seq: Sequence) -> None:
-        if seq._counted_as_inflight_load:
+        if getattr(seq, "_counted_as_inflight_load", False):
             # Normal completions already closed the timer when worker quorum
             # arrived. Abort/rejection must also release its bookkeeping.
             if metrics := getattr(self, "metrics", None):

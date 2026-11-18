@@ -1407,8 +1407,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_OFFLOAD_EARLY_LOAD_MAX_FRAC": lambda: _finite_float_env(
         "ATOM_OFFLOAD_EARLY_LOAD_MAX_FRAC", 0.15, allow_zero=True
     ),
-    # Mooncake Store restore scheduling: the cold-partial slice and the
-    # ready-suffix priority, together.
+    # Mooncake Store restore scheduling: the ready-suffix priority.
     "ATOM_STORE_RESTORE_SCHED_PRIORITY": lambda: _flag_env(
         "ATOM_STORE_RESTORE_SCHED_PRIORITY"
     ),

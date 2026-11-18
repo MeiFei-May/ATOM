@@ -923,11 +923,6 @@ class MultiConnectorScheduler(KVConnectorSchedulerBase):
         )
 
     @property
-    def pending_load_partial_token_cap(self) -> int:
-        tier = self._prefetch_tier()
-        return tier.pending_load_partial_token_cap if tier is not None else 0
-
-    @property
     def ready_suffix_first(self) -> bool:
         tier = self._prefetch_tier()
         return tier.ready_suffix_first if tier is not None else False
