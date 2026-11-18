@@ -149,7 +149,9 @@ The session key is the first non-empty header of `--session-id-headers`
 (`x-dynamo-session-id`, `x-session-id`, `x-smg-routing-key`,
 `x-session-affinity`); a request without one is routed by the policy alone.
 An empty `--session-id-headers` turns this off, except for `dp_sticky`, which
-then keys on `x-session-id` only and records the same results.
+then keys on `x-session-id` only and records the same results. Session
+affinity applies to HTTP workers only: with `grpc://` workers it is off the
+same way, and the router logs a warning at startup.
 `mesh_session_affinity_total` counts each selection of a request with a key:
 
 - `hit`: the pinned worker is healthy and its circuit breaker admits requests;

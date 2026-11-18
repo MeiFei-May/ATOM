@@ -279,6 +279,7 @@ pub struct CliArgs {
     /// Headers checked in order for a session key. The first non-empty value wins.
     /// `x-correlation-id` is not included: this router uses it as a per-request id.
     /// An empty list turns session affinity off; `dp_sticky` then keys on `x-session-id`.
+    /// Session affinity applies to HTTP workers only; with gRPC workers it is off.
     #[arg(
         long,
         default_value = DEFAULT_SESSION_ID_HEADERS,

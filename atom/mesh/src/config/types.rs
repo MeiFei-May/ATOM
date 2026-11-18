@@ -596,6 +596,20 @@ impl Default for RouterConfig {
 }
 
 impl RouterConfig {
+    /// Session affinity as the policies get it. gRPC workers do not support it:
+    /// the gRPC pipeline reports no dispatch or failure to the policies, so a
+    /// binding could never be released. There it is off, and `dp_sticky` keys on
+    /// `x-session-id` as it did before session affinity.
+    pub fn effective_session_affinity(&self) -> SessionAffinityConfig {
+        if matches!(self.connection_mode, ConnectionMode::Grpc { .. }) {
+            return SessionAffinityConfig {
+                session_id_headers: Vec::new(),
+                ..self.session_affinity.clone()
+            };
+        }
+        self.session_affinity.clone()
+    }
+
     /// Preparation settings, with the legacy ext-proc options filling unset
     /// values when the external-processing transport is enabled.
     fn effective_prepare_pool(&self) -> PreparePoolConfig {
@@ -778,6 +792,20 @@ mod tests {
         assert_eq!(config.resolved_prepare_workers(), 3);
         assert_eq!(config.resolved_prepare_pool().unwrap().queue_capacity, 30);
         assert_eq!(config.resolved_max_tokenize_bytes(), 4096);
+    }
+
+    #[test]
+    fn grpc_workers_turn_session_affinity_off() {
+        let http = RouterConfig::default();
+        assert_eq!(http.effective_session_affinity(), http.session_affinity);
+
+        let grpc = RouterConfig {
+            connection_mode: ConnectionMode::Grpc { port: None },
+            ..RouterConfig::default()
+        };
+        let effective = grpc.effective_session_affinity();
+        assert!(!effective.is_enabled());
+        assert_eq!(effective.ttl_secs, grpc.session_affinity.ttl_secs);
     }
 
     #[test]

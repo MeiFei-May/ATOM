@@ -404,9 +404,16 @@ impl AppContextBuilder {
 
     /// Create policy registry
     fn with_policy_registry(mut self, config: &RouterConfig) -> Self {
+        let session_affinity = config.effective_session_affinity();
+        if config.session_affinity.is_enabled() && !session_affinity.is_enabled() {
+            tracing::warn!(
+                "session affinity is not supported with gRPC workers; policies run without \
+                 the session table, and dp_sticky keys on x-session-id"
+            );
+        }
         self.policy_registry = Some(Arc::new(PolicyRegistry::with_session_affinity(
             config.policy.clone(),
-            config.session_affinity.clone(),
+            session_affinity,
         )));
         self
     }
@@ -456,5 +463,59 @@ impl AppContextBuilder {
 impl Default for AppContextBuilder {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{
+        config::PolicyConfig,
+        core::{prepare_pool::PreparePoolRuntime, BasicWorkerBuilder, ConnectionMode, Worker},
+        policies::{RandomPolicy, SelectWorkerInfo},
+    };
+
+    async fn policies_for(connection_mode: ConnectionMode, policy: PolicyConfig) -> AppContext {
+        let pool =
+            PreparePoolRuntime::new(RouterConfig::default().resolved_prepare_pool().unwrap())
+                .unwrap();
+        let config = RouterConfig {
+            connection_mode,
+            policy,
+            ..Default::default()
+        };
+        AppContext::from_config(config, 5, pool.handle())
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn grpc_workers_get_policies_without_the_session_table() {
+        let grpc = ConnectionMode::Grpc { port: None };
+        let random = policies_for(grpc.clone(), PolicyConfig::Random).await;
+        let default = random.policy_registry.get_default_policy();
+        assert!(default.as_any().downcast_ref::<RandomPolicy>().is_some());
+
+        let http = policies_for(ConnectionMode::Http, PolicyConfig::Random).await;
+        let default = http.policy_registry.get_default_policy();
+        assert!(default.as_any().downcast_ref::<RandomPolicy>().is_none());
+
+        // dp_sticky still pins on x-session-id over gRPC.
+        let dp_sticky = policies_for(grpc, PolicyConfig::DpSticky).await;
+        let policy = dp_sticky.policy_registry.get_default_policy();
+        let workers: Vec<Arc<dyn Worker>> = ["http://w1:8000", "http://w2:8000"]
+            .into_iter()
+            .map(|url| Arc::new(BasicWorkerBuilder::new(url).build()) as Arc<dyn Worker>)
+            .collect();
+        let mut headers = http::HeaderMap::new();
+        headers.insert("x-session-id", "session-1".parse().unwrap());
+        let info = SelectWorkerInfo {
+            headers: Some(&headers),
+            ..Default::default()
+        };
+        let first = policy.select_worker(&workers, &info).await.unwrap();
+        workers[first].increment_load();
+        workers[first].increment_load();
+        assert_eq!(policy.select_worker(&workers, &info).await, Some(first));
     }
 }
