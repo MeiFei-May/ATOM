@@ -293,8 +293,15 @@ def atom_under_stubs():
 
 @contextmanager
 def atom_without_aiter():
-    """`importlib.import_module`, against the stand-ins only where AITER is
-    not installed (the CPU job); a GPU host keeps the real kernels."""
+    """Use stand-ins without a GPU or AITER; GPU jobs keep real kernels.
+
+    A development image may include AITER even in a CPU-only container.
+    Importing its Triton kernels there probes a nonexistent GPU driver.
+    """
+    if not torch.cuda.is_available():
+        with atom_under_stubs() as load:
+            yield load
+        return
     try:
         import aiter  # noqa: F401
     except ImportError:
