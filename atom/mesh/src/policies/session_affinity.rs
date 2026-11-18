@@ -788,8 +788,21 @@ mod tests {
         assert_eq!(policy.result_count(AFFINITY_HIT), 1);
     }
 
+    /// The samples of `mesh_session_affinity_total` in `rendered`, sorted.
+    fn affinity_samples(rendered: &str) -> Vec<&str> {
+        let mut samples: Vec<_> = rendered
+            .lines()
+            .filter(|line| line.starts_with("mesh_session_affinity_total{"))
+            .collect();
+        samples.sort_unstable();
+        samples
+    }
+
     #[tokio::test]
     async fn configurable_ttl_expires_and_rebalances() {
+        let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        let _recorder = metrics::set_default_local_recorder(&recorder);
         let config = SessionAffinityConfig {
             ttl_secs: 30,
             ..SessionAffinityConfig::default()
@@ -804,6 +817,13 @@ mod tests {
         policy.set_last_access("session-1", Instant::now() - Duration::from_secs(31));
         assert_eq!(policy.select_worker(&workers, &info).await, Some(1));
         assert_eq!(policy.result_count(AFFINITY_EXPIRED), 1);
+        assert_eq!(
+            affinity_samples(&handle.render()),
+            [
+                r#"mesh_session_affinity_total{result="expired",scope="regular"} 1"#,
+                r#"mesh_session_affinity_total{result="new",scope="regular"} 1"#,
+            ]
+        );
     }
 
     #[tokio::test]
@@ -850,6 +870,15 @@ mod tests {
         assert!(policy.has_session("session-a"));
         assert!(!policy.has_session("session-b"));
         assert_eq!(policy.table_len(), 1);
+
+        // The sweep dropped session-b's binding, so its return counts as new,
+        // not expired.
+        policy
+            .select_worker(&workers, &info(&session_b))
+            .await
+            .unwrap();
+        assert_eq!(policy.result_count(AFFINITY_EXPIRED), 1);
+        assert_eq!(policy.result_count(AFFINITY_NEW), 3);
     }
 
     #[tokio::test]
@@ -895,6 +924,14 @@ mod tests {
         policy.on_dispatch("regular", Some(&headers), &workers[1]);
 
         assert_eq!(policy.result_count(AFFINITY_REBIND), 1);
+        assert_eq!(
+            affinity_samples(&handle.render()),
+            [
+                r#"mesh_session_affinity_total{result="hit",scope="regular"} 1"#,
+                r#"mesh_session_affinity_total{result="new",scope="regular"} 1"#,
+                r#"mesh_session_affinity_total{result="rebind",scope="regular"} 1"#,
+            ]
+        );
         let changes: Vec<_> = handle
             .render()
             .lines()
